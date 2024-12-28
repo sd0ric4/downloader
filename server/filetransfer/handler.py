@@ -6,7 +6,7 @@ import queue
 import socket
 import threading
 import select
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, Set
 from dataclasses import dataclass
 
 from filetransfer.protocol import (
@@ -26,8 +26,43 @@ class IOMode(Enum):
     ASYNC = 4  # asyncio模式
 
 
+class ProtocolError(Exception):
+    """协议相关错误的基类"""
+
+    pass
+
+
+class VersionMismatchError(ProtocolError):
+    """版本不匹配错误"""
+
+    pass
+
+
+class InvalidStateError(ProtocolError):
+    """状态错误"""
+
+    pass
+
+
+class ChecksumError(ProtocolError):
+    """校验和错误"""
+
+    pass
+
+
+@dataclass
+class TransferContext:
+    """传输上下文"""
+
+    filename: str
+    total_chunks: int
+    current_chunk: int = 0
+    file_size: int = 0
+    checksum: Optional[int] = None
+
+
 class BaseProtocolHandler(ABC):
-    """协议处理器基类"""
+    """增强的协议处理器基类"""
 
     def __init__(self):
         self.state = ProtocolState.INIT
@@ -35,20 +70,94 @@ class BaseProtocolHandler(ABC):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.protocol_version = ProtocolVersion.V1
         self.magic = PROTOCOL_MAGIC
+        self.supported_versions: Set[ProtocolVersion] = {ProtocolVersion.V1}
+        self._error_handlers: Dict[type, Callable] = {}
+        self.session_id: Optional[int] = None
+        self.sequence_number: int = 0
+        self.transfer_context: Optional[TransferContext] = None
 
     def register_handler(self, msg_type: MessageType, handler: Callable) -> None:
-        """
-        注册消息类型对应的处理函数
+        """注册消息处理器"""
+        self._validate_handler_signature(handler)
+        if msg_type in self.handlers:
+            raise ValueError(
+                f"Handler for message type {msg_type} is already registered"
+            )
+        self.handlers[msg_type] = handler
 
-        Args:
-            msg_type: 消息类型
-            handler: 处理函数
+    def handle_message(self, header: ProtocolHeader, payload: bytes) -> None:
+        """处理收到的消息"""
+        try:
+            # 魔数检查
+            if header.magic != self.magic:
+                self.logger.error("Invalid magic number")
+                return
 
-        Raises:
-            ValueError: 当消息类型已注册时
-            TypeError: 当处理函数签名不正确时
-        """
-        # 验证处理函数签名
+            # 版本检查
+            if header.version not in self.supported_versions:
+                self.logger.error("Protocol version mismatch")
+                return
+
+            # 校验和检查
+            if not self.verify_checksum(header, payload):
+                self.logger.error("Checksum verification failed")
+                return
+
+            # 非握手消息的状态检查
+            if (
+                header.msg_type != MessageType.HANDSHAKE
+                and self.state == ProtocolState.INIT
+            ):
+                self.logger.error("Invalid state for non-handshake message")
+                return
+
+            # 特殊消息类型的状态处理
+            if header.msg_type == MessageType.ERROR:
+                self.state = ProtocolState.ERROR
+            elif header.msg_type == MessageType.CLOSE:
+                if self.state != ProtocolState.INIT:
+                    self.state = ProtocolState.COMPLETED
+            elif header.msg_type == MessageType.HANDSHAKE:
+                if self.state == ProtocolState.INIT:
+                    self.state = ProtocolState.CONNECTED
+            elif header.msg_type == MessageType.FILE_DATA:
+                if self.state == ProtocolState.CONNECTED:
+                    self.state = ProtocolState.TRANSFERRING
+
+            # 分发消息
+            self._dispatch_message(header, payload)
+
+            # 更新序列号（仅在正常消息处理后）
+            if header.msg_type not in {MessageType.HANDSHAKE, MessageType.ERROR}:
+                self.sequence_number = header.sequence_number
+
+        except Exception as e:
+            self.logger.error(f"Error handling message: {e}")
+
+    def _validate_message(self, header: ProtocolHeader, payload: bytes) -> None:
+        """验证消息的有效性"""
+        if header.magic != self.magic:
+            raise ProtocolError("Invalid magic number")
+
+        if header.version not in self.supported_versions:
+            raise VersionMismatchError("Protocol version mismatch")
+
+        if not self.verify_checksum(header, payload):
+            raise ChecksumError("Checksum verification failed")
+
+    def check_state(
+        self, expected_state: ProtocolState, raise_error: bool = False
+    ) -> bool:
+        """检查当前状态是否符合预期"""
+        is_valid = self.state == expected_state
+        if not is_valid and raise_error:
+            raise ValueError(
+                f"Invalid state: expected {expected_state}, but got {self.state}"
+            )
+        return is_valid
+
+    def _validate_handler_signature(self, handler: Callable) -> None:
+        """验证处理器函数签名"""
         import inspect
 
         sig = inspect.signature(handler)
@@ -58,79 +167,19 @@ class BaseProtocolHandler(ABC):
                 "Handler must accept exactly 2 parameters (header, payload)"
             )
 
-        # 检查重复注册
-        if msg_type in self.handlers:
-            raise ValueError(
-                f"Handler for message type {msg_type} is already registered"
-            )
+    @abstractmethod
+    def _dispatch_message(self, header: ProtocolHeader, payload: bytes) -> None:
+        """分发消息到具体的处理函数"""
+        pass
 
-        self.handlers[msg_type] = handler
-
-    def handle_message(self, header: ProtocolHeader, payload: bytes) -> None:
-        """处理收到的消息的基础流程"""
-        if header.magic != self.magic:
-            self.logger.error("Invalid magic number")
-            return
-
-        if header.version != self.protocol_version:
-            self.logger.error("Protocol version mismatch")
-            return
-
-        if not self.verify_checksum(header, payload):
-            self.logger.error("Checksum verification failed")
-            return
-
-        # 非握手消息的状态检查
-        if (
-            header.msg_type != MessageType.HANDSHAKE
-            and self.state == ProtocolState.INIT
-        ):
-            self.logger.error("Invalid state for non-handshake message")
-            return
-
-        # 状态检查和消息处理
-        if header.msg_type == MessageType.CLOSE:
-            # CLOSE message handling - preserve INIT state if we're in it
-            current_state = self.state
-            self._dispatch_message(header, payload)
-            if current_state == ProtocolState.INIT:
-                self.state = ProtocolState.INIT  # Force state back to INIT
-            return
-
-        # 其他消息的状态检查
-        if header.msg_type != MessageType.HANDSHAKE:
-            valid_states = [ProtocolState.CONNECTED, ProtocolState.TRANSFERRING]
-            if self.state not in valid_states:
-                self.logger.error(
-                    f"Invalid state {self.state} for message type {header.msg_type}"
-                )
-                return
-
-        # 处理消息
-        self._dispatch_message(header, payload)
-
-    def check_state(
-        self, expected_state: ProtocolState, raise_error: bool = False
-    ) -> bool:
-        """
-        检查当前状态是否符合预期
-
-        Args:
-            expected_state: 预期的状态
-            raise_error: 如果为True且状态不匹配则抛出异常
-
-        Returns:
-            bool: 状态是否匹配
-
-        Raises:
-            ValueError: 当raise_error为True且状态不匹配时
-        """
-        is_valid = self.state == expected_state
-        if not is_valid and raise_error:
-            raise ValueError(
-                f"Invalid state: expected {expected_state}, but got {self.state}"
-            )
-        return is_valid
+    @abstractmethod
+    def close(self) -> None:
+        """关闭处理器，清理资源"""
+        self.state = ProtocolState.COMPLETED
+        self.handlers.clear()
+        self._error_handlers.clear()
+        self.session_id = None
+        self.transfer_context = None
 
     def verify_checksum(self, header: ProtocolHeader, payload: bytes) -> bool:
         """验证校验和"""
@@ -138,10 +187,14 @@ class BaseProtocolHandler(ABC):
         actual = header.calculate_checksum(payload)
         return expected == actual
 
-    @abstractmethod
-    def _dispatch_message(self, header: ProtocolHeader, payload: bytes) -> None:
-        """分发消息到具体的处理函数"""
-        pass
+    def add_supported_version(self, version: ProtocolVersion) -> None:
+        """添加支持的协议版本"""
+        self.supported_versions.add(version)
+
+    def remove_supported_version(self, version: ProtocolVersion) -> None:
+        """移除支持的协议版本"""
+        if version in self.supported_versions:
+            self.supported_versions.remove(version)
 
 
 class ThreadedProtocolHandler(BaseProtocolHandler):
