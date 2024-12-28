@@ -80,7 +80,16 @@ class BaseProtocolHandler(ABC):
             self.logger.error("Checksum verification failed")
             return
 
-        # 状态检查 - 除了握手消息外,其他消息都需要在合适的状态
+        # 状态检查和消息处理
+        if header.msg_type == MessageType.CLOSE:
+            # CLOSE message handling - preserve INIT state if we're in it
+            current_state = self.state
+            self._dispatch_message(header, payload)
+            if current_state == ProtocolState.INIT:
+                self.state = ProtocolState.INIT  # Force state back to INIT
+            return
+
+        # 其他消息的状态检查
         if header.msg_type != MessageType.HANDSHAKE:
             valid_states = [ProtocolState.CONNECTED, ProtocolState.TRANSFERRING]
             if self.state not in valid_states:
@@ -89,7 +98,7 @@ class BaseProtocolHandler(ABC):
                 )
                 return
 
-        # 无论状态如何，都调用 dispatch_message 以便设置响应
+        # 处理消息
         self._dispatch_message(header, payload)
 
     def check_state(
