@@ -80,6 +80,14 @@ class BaseProtocolHandler(ABC):
             self.logger.error("Checksum verification failed")
             return
 
+        # 非握手消息的状态检查
+        if (
+            header.msg_type != MessageType.HANDSHAKE
+            and self.state == ProtocolState.INIT
+        ):
+            self.logger.error("Invalid state for non-handshake message")
+            return
+
         # 状态检查和消息处理
         if header.msg_type == MessageType.CLOSE:
             # CLOSE message handling - preserve INIT state if we're in it
