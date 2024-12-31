@@ -11,7 +11,7 @@ from filetransfer.protocol import (
     ProtocolVersion,
     PROTOCOL_MAGIC,
 )
-from filetransfer.socket_wrapper import ProtocolSocket
+from filetransfer.network import ProtocolSocket
 from filetransfer.handler import (
     create_protocol_handler,
     IOMode,
@@ -79,10 +79,20 @@ class TestSingleThreadedProtocolHandler(unittest.TestCase):
             logger.info("Handling error message")
             return False
 
+        def handle_file_request(header: ProtocolHeader, payload: bytes) -> None:
+            # 先设置响应
+            self.responses[header.msg_type] = (MessageType.ACK, b"FILE_REQUEST_OK")
+            if not self.handler.check_state(ProtocolState.CONNECTED):
+                self.handler.state = ProtocolState.ERROR
+                return
+            self.handler.state = ProtocolState.TRANSFERRING
+
         # 注册消息处理器
         self.handler.register_handler(MessageType.HANDSHAKE, handle_handshake)
         self.handler.register_handler(MessageType.CLOSE, handle_close)
         self.handler.register_handler(MessageType.ERROR, handle_error)
+        # 注册文件请求处理器
+        self.handler.register_handler(MessageType.FILE_REQUEST, handle_file_request)
 
     def test_handshake_success(self):
         """测试成功的握手过程"""
