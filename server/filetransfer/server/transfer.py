@@ -18,27 +18,6 @@ from filetransfer.protocol import (
 from filetransfer.protocol.tools import MessageBuilder
 
 
-from pathlib import Path
-import struct
-from typing import Optional, Dict, Tuple, List
-import logging
-from dataclasses import dataclass
-from datetime import datetime
-import os
-import zlib
-from .file_manager import FileManager, TransferContext
-from filetransfer.protocol import (
-    ProtocolHeader,
-    MessageType,
-    ProtocolState,
-    ListRequest,
-    ListFilter,
-    ListResponseFormat,
-    PROTOCOL_MAGIC,
-)
-from filetransfer.protocol.tools import MessageBuilder
-
-
 class FileTransferService:
     """集成文件管理和消息构建的服务类"""
 
@@ -100,6 +79,7 @@ class FileTransferService:
                 MessageType.CHECKSUM_VERIFY,
                 MessageType.ACK,
                 MessageType.FILE_REQUEST,  # 允许在传输状态下发起新的文件请求
+                MessageType.RESUME_REQUEST,  # 允许在传输状态下发起断点续传请求
             ],
             ProtocolState.COMPLETED: [
                 MessageType.FILE_REQUEST,
@@ -137,105 +117,6 @@ class FileTransferService:
         except struct.error:
             return self.message_builder.build_error("Invalid handshake payload")
 
-    def _handle_file_request(
-        self, header: ProtocolHeader, payload: bytes
-    ) -> Tuple[bytes, bytes]:
-        """处理文件请求"""
-        try:
-            filename = payload.decode("utf-8")
-            file_path = self.root_dir / filename
-
-            # 创建或获取文件信息
-            if not file_path.exists():
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                file_path.touch()
-                file_size = self.file_manager.chunk_size * 5  # 固定为5个块大小
-            else:
-                file_info = self.file_manager.get_file_info(filename)
-                file_size = file_info.size
-
-            # 准备传输上下文
-            context = self.file_manager.prepare_transfer(
-                str(header.session_id), filename, file_size
-            )
-
-            if not context:
-                return self.message_builder.build_error("Failed to prepare transfer")
-
-            # 保存会话ID并更新状态
-            self.message_builder.session_id = header.session_id
-            self.message_builder.state = ProtocolState.TRANSFERRING
-
-            # 构建元数据响应
-            return self.message_builder.build_file_metadata(filename, file_size, 0)
-
-        except UnicodeDecodeError:
-            return self.message_builder.build_error("Invalid filename encoding")
-        except Exception as e:
-            return self.message_builder.build_error(f"File request error: {str(e)}")
-
-    def _handle_file_data(
-        self, header: ProtocolHeader, payload: bytes
-    ) -> Tuple[bytes, bytes]:
-        """处理文件数据"""
-        try:
-            file_id = str(header.session_id)
-            context = self.file_manager.transfers.get(file_id)
-
-            if not context:
-                # 如果缺少上下文，尝试查找对应的文件并创建上下文
-                files = list(self.root_dir.iterdir())
-                if files:
-                    # 使用找到的第一个文件作为目标
-                    target_file = files[0]
-                    context = self.file_manager.prepare_transfer(
-                        file_id,
-                        target_file.name,
-                        self.file_manager.chunk_size * 5,  # 固定大小
-                    )
-                if not context:
-                    return self.message_builder.build_error("No active transfer")
-
-            # 验证块号
-            total_chunks = (
-                context.file_size + self.file_manager.chunk_size - 1
-            ) // self.file_manager.chunk_size
-            if header.chunk_number >= total_chunks:
-                return self.message_builder.build_error(
-                    f"Invalid chunk number: {header.chunk_number}"
-                )
-
-            # 验证块大小
-            expected_size = min(
-                self.file_manager.chunk_size,
-                context.file_size - header.chunk_number * self.file_manager.chunk_size,
-            )
-            if len(payload) > expected_size:
-                return self.message_builder.build_error("Chunk size exceeds limit")
-
-            # 写入数据块
-            if not self.file_manager.write_chunk(file_id, payload, header.chunk_number):
-                return self.message_builder.build_error("Failed to write chunk")
-
-            # 返回确认消息
-            ack_header = ProtocolHeader(
-                magic=PROTOCOL_MAGIC,
-                version=self.message_builder.version,
-                msg_type=MessageType.ACK,
-                payload_length=4,
-                sequence_number=header.sequence_number,
-                checksum=0,
-                chunk_number=header.chunk_number,
-                session_id=header.session_id,
-            )
-            ack_payload = struct.pack("!I", header.sequence_number)
-            ack_header.checksum = ack_header.calculate_checksum(ack_payload)
-            return ack_header.to_bytes(), ack_payload
-
-        except Exception as e:
-            self.logger.error(f"Error handling file data: {str(e)}")
-            return self.message_builder.build_error(f"Internal error: {str(e)}")
-
     def _handle_checksum_verify(
         self, header: ProtocolHeader, payload: bytes
     ) -> Tuple[bytes, bytes]:
@@ -266,11 +147,14 @@ class FileTransferService:
         """处理列表请求"""
         try:
             list_request = ListRequest.from_bytes(payload)
+            self.logger.debug(f"Parsed list request: {list_request}")
+
             files = self.file_manager.list_files(
                 path=list_request.path,
                 recursive=False,
                 include_dirs=(list_request.filter != ListFilter.FILES_ONLY),
             )
+            self.logger.debug(f"Found {len(files)} files")
 
             entries = [
                 (f.name, f.size, int(f.modified_time.timestamp()), f.is_directory)
@@ -278,12 +162,96 @@ class FileTransferService:
                 if (list_request.filter != ListFilter.DIRS_ONLY or f.is_directory)
                 and (list_request.filter != ListFilter.FILES_ONLY or not f.is_directory)
             ]
+            self.logger.debug(f"Filtered to {len(entries)} entries")
 
             return self.message_builder.build_list_response(
                 entries, list_request.format
             )
         except Exception as e:
+            self.logger.error(f"Error handling list request: {str(e)}")
             return self.message_builder.build_list_error(str(e))
+
+    def _handle_file_request(
+        self, header: ProtocolHeader, payload: bytes
+    ) -> Tuple[bytes, bytes]:
+        """处理文件请求"""
+        try:
+            filename = payload.decode("utf-8")
+            file_path = self.root_dir / filename
+
+            # 获取或创建文件
+            if not file_path.exists():
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.touch()
+
+            # 获取实际文件大小
+            file_size = file_path.stat().st_size
+
+            # 准备传输上下文
+            context = self.file_manager.prepare_transfer(
+                str(header.session_id), filename, file_size
+            )
+            if not context:
+                return self.message_builder.build_error("Failed to prepare transfer")
+
+            # 更新状态
+            self.message_builder.session_id = header.session_id
+            self.message_builder.state = ProtocolState.TRANSFERRING
+
+            return self.message_builder.build_file_metadata(filename, file_size, 0)
+
+        except UnicodeDecodeError:
+            return self.message_builder.build_error("Invalid filename encoding")
+        except Exception as e:
+            return self.message_builder.build_error(f"File request error: {str(e)}")
+
+    def _handle_file_data(
+        self, header: ProtocolHeader, payload: bytes
+    ) -> Tuple[bytes, bytes]:
+        """处理文件数据"""
+        try:
+            file_id = str(header.session_id)
+            context = self.file_manager.transfers.get(file_id)
+
+            if not context:
+                return self.message_builder.build_error("No active transfer")
+
+            # 验证块号
+            total_chunks = max(
+                1,
+                (context.file_size + self.file_manager.chunk_size - 1)
+                // self.file_manager.chunk_size,
+            )
+            if header.chunk_number >= total_chunks:
+                return self.message_builder.build_error(
+                    f"Invalid chunk number: {header.chunk_number}"
+                )
+
+            # 验证块大小
+            expected_size = (
+                min(
+                    self.file_manager.chunk_size,
+                    context.file_size
+                    - header.chunk_number * self.file_manager.chunk_size,
+                )
+                if context.file_size > 0
+                else self.file_manager.chunk_size
+            )
+            if len(payload) > expected_size:
+                return self.message_builder.build_error("Chunk size exceeds limit")
+
+            # 写入数据块
+            if not self.file_manager.write_chunk(file_id, payload, header.chunk_number):
+                return self.message_builder.build_error("Failed to write chunk")
+
+            # 返回分块确认消息
+            return self.message_builder.build_chunk_ack(
+                header.sequence_number, header.chunk_number
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error handling file data: {str(e)}")
+            return self.message_builder.build_error(f"Internal error: {str(e)}")
 
     def _handle_resume_request(
         self, header: ProtocolHeader, payload: bytes
@@ -293,24 +261,36 @@ class FileTransferService:
             offset = struct.unpack("!Q", payload[:8])[0]
             filename = payload[8:].decode("utf-8")
 
-            if not (self.root_dir / filename).exists():
+            file_path = self.root_dir / filename
+            if not file_path.exists():
                 return self.message_builder.build_error("File not found")
 
-            file_size = self.file_manager.chunk_size * 5  # 固定大小
-            context = self.file_manager.resume_transfer(
+            # 获取实际文件大小
+            file_size = file_path.stat().st_size
+
+            # 验证偏移量
+            if offset > file_size:
+                return self.message_builder.build_error("Invalid offset")
+
+            # 准备传输上下文
+            context = self.file_manager.prepare_transfer(
                 str(header.session_id), filename, file_size
             )
-
             if not context:
-                return self.message_builder.build_error("Failed to resume transfer")
+                return self.message_builder.build_error("Failed to prepare transfer")
 
+            # 更新状态
+            self.message_builder.session_id = header.session_id
             self.message_builder.state = ProtocolState.TRANSFERRING
+
             return self.message_builder.build_file_metadata(
                 filename, file_size, context.checksum or 0
             )
 
         except (struct.error, UnicodeDecodeError):
             return self.message_builder.build_error("Invalid resume request payload")
+        except Exception as e:
+            return self.message_builder.build_error(f"Resume error: {str(e)}")
 
     def _find_last_context(self, session_id: int) -> Optional[TransferContext]:
         """查找可能存在的上一个传输上下文"""
@@ -343,7 +323,3 @@ class FileTransferService:
         """开始新会话"""
         self.message_builder.start_session()
         self.message_builder.state = ProtocolState.INIT
-
-    def cleanup(self) -> None:
-        """清理资源"""
-        self.file_manager.cleanup_transfer(str(self.message_builder.session_id))
