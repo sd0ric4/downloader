@@ -311,6 +311,7 @@ class TransferUtils:
         path: str = "",
         list_format: ListResponseFormat = ListResponseFormat.DETAIL,
         list_filter: ListFilter = ListFilter.ALL,
+        recursive: bool = False,  # 添加递归参数
     ) -> ListResult:
         """列出目录内容
 
@@ -327,34 +328,47 @@ class TransferUtils:
             self.service.start_session()
 
             # 发送handshake消息
+            handshake_header = self.create_header(MessageType.HANDSHAKE)
+            handshake_payload = struct.pack("!I", 1)  # 版本号为1
+            resp_header_bytes, _ = self.service.handle_message(
+                handshake_header, handshake_payload
+            )
+            resp_header = ProtocolHeader.from_bytes(resp_header_bytes)
 
-            # 创建列表请求
+            if resp_header.msg_type == MessageType.ERROR:
+                return TransferResult(False, "握手失败", 0)
+
+            all_entries = []
+
+            # 获取当前目录的内容
             list_req = ListRequest(format=list_format, filter=list_filter, path=path)
-
-            # 发送请求
             payload = list_req.to_bytes()
             header = self.create_header(MessageType.LIST_REQUEST, len(payload))
-
-            # 获取响应
             response_header, response_payload = self.service.handle_message(
                 header, payload
             )
-            resp_header = ProtocolHeader.from_bytes(response_header)
 
-            if resp_header.msg_type == MessageType.ERROR:
-                error_msg = response_payload.decode("utf-8")
-                return ListResult(False, f"获取列表失败: {error_msg}")
-
-            if resp_header.msg_type != MessageType.LIST_RESPONSE:
-                return ListResult(False, "响应类型错误")
-
-            # 解析响应
+            # 解析当前目录内容
             entries = self._parse_list_response(response_payload)
-            return ListResult(True, "获取列表成功", entries)
+            all_entries.extend(entries)
+
+            # 如果需要递归,遍历所有子目录
+            if recursive:
+                for name, size, mtime, is_dir in entries:
+                    if is_dir:
+                        # 构建子目录路径
+                        sub_path = f"{path}/{name}".lstrip("/")
+                        # 递归获取子目录内容
+                        sub_result = self.list_directory(
+                            sub_path, list_format, list_filter, recursive=True
+                        )
+                        if sub_result.success:
+                            all_entries.extend(sub_result.entries)
+
+            return ListResult(True, "获取列表成功", all_entries)
 
         except Exception as e:
-            self.logger.error(f"获取列表失败: {str(e)}")
-            return ListResult(False, f"获取列表错误: {str(e)}")
+            return ListResult(False, f"列表获取失败: {str(e)}")
 
     def _parse_list_response(self, payload: bytes) -> List[Tuple[str, int, int, bool]]:
         """解析列表响应数据
