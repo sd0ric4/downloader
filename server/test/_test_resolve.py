@@ -16,6 +16,7 @@ from filetransfer.handler import (
     create_protocol_handler,
     IOMode,
 )
+from filetransfer.protocol.tools import MessageBuilder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class TestSingleThreadedProtocolHandler(unittest.TestCase):
         self.handler = create_protocol_handler(IOMode.SINGLE)
         self.responses = {}
         self.setup_handler()
+        self.message_builder = MessageBuilder(version=ProtocolVersion.V1)
 
     def setup_handler(self):
         """配置协议处理器"""
@@ -96,22 +98,21 @@ class TestSingleThreadedProtocolHandler(unittest.TestCase):
 
     def test_handshake_success(self):
         """测试成功的握手过程"""
-        # 创建一对connected sockets用于测试
         server_sock, client_sock = socket.socketpair()
         try:
-            # 包装socket
             test_socket = TestSocket(server_sock, self.handler)
             client = TestSocket(client_sock, self.handler)
 
-            # 客户端发送握手消息
-            handshake_payload = ProtocolVersion.V1.to_bytes(4, "big")
-            header = client.send_message(MessageType.HANDSHAKE, handshake_payload)
+            # 使用 MessageBuilder 构建握手消息
+            header_bytes, payload = self.message_builder.build_handshake()
+            header = ProtocolHeader.from_bytes(header_bytes)
+            client.send_message(header.msg_type, payload)
 
             # 服务端接收并处理消息
             msg_header, msg_payload = test_socket.receive_message()
             self.handler.handle_message(msg_header, msg_payload)
 
-            # 服务端发送响应(从handler获取响应)
+            # 服务端发送响应
             response_type, response_payload = self.responses[msg_header.msg_type]
             test_socket.send_message(response_type, response_payload)
 
@@ -123,8 +124,11 @@ class TestSingleThreadedProtocolHandler(unittest.TestCase):
             self.assertEqual(resp_payload, b"OK")
             self.assertEqual(self.handler.state, ProtocolState.CONNECTED)
 
-            # 发送关闭消息
-            header = client.send_message(MessageType.CLOSE, b"")
+            # 使用 MessageBuilder 构建关闭消息
+            header_bytes, payload = self.message_builder.build_close()
+            header = ProtocolHeader.from_bytes(header_bytes)
+            client.send_message(header.msg_type, payload)
+
             msg_header, msg_payload = test_socket.receive_message()
             self.handler.handle_message(msg_header, msg_payload)
 
@@ -149,10 +153,11 @@ class TestSingleThreadedProtocolHandler(unittest.TestCase):
             test_socket = TestSocket(server_sock, self.handler)
             client = TestSocket(client_sock, self.handler)
 
-            # 发送错误版本的握手消息
-            invalid_version = 99
-            handshake_payload = invalid_version.to_bytes(4, "big")
-            header = client.send_message(MessageType.HANDSHAKE, handshake_payload)
+            # 创建一个带有无效版本的消息构建器
+            invalid_builder = MessageBuilder(version=99)
+            header_bytes, payload = invalid_builder.build_handshake()
+            header = ProtocolHeader.from_bytes(header_bytes)
+            client.send_message(header.msg_type, payload)
 
             # 服务端接收并处理消息
             msg_header, msg_payload = test_socket.receive_message()
@@ -185,6 +190,7 @@ class TestSingleThreadedProtocolHandlerExtended(unittest.TestCase):
         self.server_sock, self.client_sock = socket.socketpair()
         self.test_socket = TestSocket(self.server_sock, self.handler)
         self.client = TestSocket(self.client_sock, self.handler)
+        self.message_builder = MessageBuilder(version=ProtocolVersion.V1)
 
     def tearDown(self):
         self.server_sock.close()
@@ -337,22 +343,32 @@ class TestSingleThreadedProtocolHandlerExtended(unittest.TestCase):
 
     def test_file_transfer_sequence(self):
         """测试完整的文件传输序列"""
-        # 1. 握手
-        handshake_payload = ProtocolVersion.V1.to_bytes(4, "big")
-        self.client.send_message(MessageType.HANDSHAKE, handshake_payload)
+        # 1. 使用 MessageBuilder 构建握手消息
+        header_bytes, payload = self.message_builder.build_handshake()
+        header = ProtocolHeader.from_bytes(header_bytes)
+        self.client.send_message(header.msg_type, payload)
+
         msg_header, msg_payload = self.test_socket.receive_message()
         self.handler.handle_message(msg_header, msg_payload)
         self.assertEqual(self.handler.state, ProtocolState.CONNECTED)
 
-        # 2. 发送文件请求
-        self.client.send_message(MessageType.FILE_REQUEST, b"test.txt")
+        # 2. 使用 MessageBuilder 构建文件请求
+        header_bytes, payload = self.message_builder.build_file_request("test.txt")
+        header = ProtocolHeader.from_bytes(header_bytes)
+        self.client.send_message(header.msg_type, payload)
+
         msg_header, msg_payload = self.test_socket.receive_message()
         self.handler.handle_message(msg_header, msg_payload)
         self.assertEqual(self.handler.state, ProtocolState.TRANSFERRING)
 
         # 3. 发送文件数据
         file_data = b"Hello, World!"
-        self.client.send_message(MessageType.FILE_DATA, file_data)
+        header_bytes, payload = self.message_builder.build_message(
+            MessageType.FILE_DATA, file_data
+        )
+        header = ProtocolHeader.from_bytes(header_bytes)
+        self.client.send_message(header.msg_type, payload)
+
         msg_header, msg_payload = self.test_socket.receive_message()
         self.handler.handle_message(msg_header, msg_payload)
         response_type, response_payload = self.responses[msg_header.msg_type]
@@ -438,19 +454,19 @@ class TestSingleThreadedProtocolHandlerExtended(unittest.TestCase):
     def test_list_request(self):
         """测试详细文件列表请求"""
         # 先进行握手
-        handshake_payload = ProtocolVersion.V1.to_bytes(4, "big")
-        self.client.send_message(MessageType.HANDSHAKE, handshake_payload)
+        header_bytes, payload = self.message_builder.build_handshake()
+        header = ProtocolHeader.from_bytes(header_bytes)
+        self.client.send_message(header.msg_type, payload)
+
         msg_header, msg_payload = self.test_socket.receive_message()
         self.handler.handle_message(msg_header, msg_payload)
 
-        # 创建LIST请求负载
-        list_request = ListRequest(
+        # 使用 MessageBuilder 构建 LIST 请求
+        header_bytes, payload = self.message_builder.build_list_request(
             format=ListResponseFormat.DETAIL, filter=ListFilter.ALL, path="/"
         )
-        list_payload = list_request.to_bytes()
-
-        # 发送LIST请求
-        self.client.send_message(MessageType.LIST_REQUEST, list_payload)
+        header = ProtocolHeader.from_bytes(header_bytes)
+        self.client.send_message(header.msg_type, payload)
         msg_header, msg_payload = self.test_socket.receive_message()
         self.handler.handle_message(msg_header, msg_payload)
 
@@ -471,14 +487,19 @@ class TestSingleThreadedProtocolHandlerExtended(unittest.TestCase):
     def test_nlst_request(self):
         """测试简单文件名列表请求"""
         # 先进行握手
-        handshake_payload = ProtocolVersion.V1.to_bytes(4, "big")
-        self.client.send_message(MessageType.HANDSHAKE, handshake_payload)
+        header_bytes, payload = self.message_builder.build_handshake()
+        header = ProtocolHeader.from_bytes(header_bytes)
+        self.client.send_message(header.msg_type, payload)
+
         msg_header, msg_payload = self.test_socket.receive_message()
         self.handler.handle_message(msg_header, msg_payload)
 
-        # 发送NLST请求
-        filter_payload = ListFilter.ALL.to_bytes(4, "big")
-        self.client.send_message(MessageType.NLST_REQUEST, filter_payload)
+        # 使用 MessageBuilder 构建 NLST 请求
+        header_bytes, payload = self.message_builder.build_nlst_request(
+            filter=ListFilter.ALL, path="/"
+        )
+        header = ProtocolHeader.from_bytes(header_bytes)
+        self.client.send_message(header.msg_type, payload)
         msg_header, msg_payload = self.test_socket.receive_message()
         self.handler.handle_message(msg_header, msg_payload)
 

@@ -16,7 +16,7 @@ from filetransfer.protocol import (
     ProtocolVersion,
     PROTOCOL_MAGIC,
 )
-from filetransfer.socket_wrapper import ProtocolSocket
+from filetransfer.network import ProtocolSocket
 
 
 class IOMode(Enum):
@@ -88,51 +88,84 @@ class BaseProtocolHandler(ABC):
     def handle_message(self, header: ProtocolHeader, payload: bytes) -> None:
         """处理收到的消息"""
         try:
-            # 魔数检查
+            # 1. 基础验证
             if header.magic != self.magic:
                 self.logger.error("Invalid magic number")
                 return
 
-            # 版本检查
             if header.version not in self.supported_versions:
                 self.logger.error("Protocol version mismatch")
                 return
 
-            # 校验和检查
             if not self.verify_checksum(header, payload):
                 self.logger.error("Checksum verification failed")
                 return
 
-            # 非握手消息的状态检查
-            if (
-                header.msg_type != MessageType.HANDSHAKE
-                and self.state == ProtocolState.INIT
-            ):
+            # 2. 状态检查和消息处理
+            # 特殊处理：ERROR 和 LIST_ERROR 消息
+            if header.msg_type in {MessageType.ERROR, MessageType.LIST_ERROR}:
+                self.state = ProtocolState.ERROR
+                self._dispatch_message(header, payload)
+                return
+
+            # 特殊处理：HANDSHAKE 消息
+            if header.msg_type == MessageType.HANDSHAKE:
+                self._dispatch_message(header, payload)
+                return
+
+            # ACK 消息可以在任何非 INIT 状态处理
+            if header.msg_type == MessageType.ACK:
+                if self.state != ProtocolState.INIT:
+                    self._dispatch_message(header, payload)
+                return
+
+            # 其他消息的状态检查
+            if self.state == ProtocolState.INIT:
                 self.logger.error("Invalid state for non-handshake message")
                 return
 
-            # 特殊消息类型的状态处理
-            if header.msg_type == MessageType.ERROR:
-                self.state = ProtocolState.ERROR
-            elif header.msg_type == MessageType.CLOSE:
-                if self.state != ProtocolState.INIT:
-                    self.state = ProtocolState.COMPLETED
-            elif header.msg_type == MessageType.HANDSHAKE:
-                if self.state == ProtocolState.INIT:
-                    self.state = ProtocolState.CONNECTED
-            elif header.msg_type == MessageType.FILE_DATA:
-                if self.state == ProtocolState.CONNECTED:
-                    self.state = ProtocolState.TRANSFERRING
+            # 3. 根据当前状态和消息类型处理
+            can_process = False
 
-            # 分发消息
-            self._dispatch_message(header, payload)
+            if self.state == ProtocolState.CONNECTED:
+                # CONNECTED 状态可以处理的消息
+                if header.msg_type in {
+                    MessageType.FILE_REQUEST,
+                    MessageType.LIST_REQUEST,
+                    MessageType.NLST_REQUEST,
+                    MessageType.CLOSE,
+                    MessageType.RESUME_REQUEST,
+                    MessageType.LIST_RESPONSE,
+                    MessageType.NLST_RESPONSE,
+                }:
+                    can_process = True
 
-            # 更新序列号（仅在正常消息处理后）
-            if header.msg_type not in {MessageType.HANDSHAKE, MessageType.ERROR}:
-                self.sequence_number = header.sequence_number
+            elif self.state == ProtocolState.TRANSFERRING:
+                # TRANSFERRING 状态可以处理的消息
+                if header.msg_type in {
+                    MessageType.FILE_DATA,
+                    MessageType.FILE_METADATA,
+                    MessageType.CHECKSUM_VERIFY,
+                    MessageType.CLOSE,
+                    MessageType.LIST_RESPONSE,
+                    MessageType.NLST_RESPONSE,
+                }:
+                    can_process = True
+
+            if can_process:
+                self._dispatch_message(header, payload)
+
+                # 4. 更新序列号（仅在正常消息处理后）
+                if header.msg_type not in {
+                    MessageType.HANDSHAKE,
+                    MessageType.ERROR,
+                    MessageType.LIST_ERROR,
+                }:
+                    self.sequence_number = header.sequence_number
 
         except Exception as e:
             self.logger.error(f"Error handling message: {e}")
+            self.state = ProtocolState.ERROR
 
     def _validate_message(self, header: ProtocolHeader, payload: bytes) -> None:
         """验证消息的有效性"""
@@ -463,6 +496,10 @@ class SingleThreadedProtocolHandler(BaseProtocolHandler):
                 self.logger.error(f"Message handler error: {e}")
         else:
             self.logger.warning(f"No handler for message type: {header.msg_type}")
+
+    def close(self) -> None:
+        """实现父类的抽象方法，关闭处理器并清理资源"""
+        super().close()
 
 
 def create_protocol_handler(mode: IOMode, **kwargs) -> BaseProtocolHandler:

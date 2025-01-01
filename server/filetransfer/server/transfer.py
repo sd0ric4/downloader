@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import struct
 from typing import Optional, Dict, Tuple, List
@@ -16,6 +17,8 @@ from filetransfer.protocol import (
     PROTOCOL_MAGIC,
 )
 from filetransfer.protocol.tools import MessageBuilder
+import socket
+from filetransfer.network import ProtocolSocket, IOMode
 
 
 class FileTransferService:
@@ -323,3 +326,130 @@ class FileTransferService:
         """开始新会话"""
         self.message_builder.start_session()
         self.message_builder.state = ProtocolState.INIT
+
+
+class ProtocolServer:
+    """基于 ProtocolSocket 的文件传输服务器"""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        root_dir: str,
+        temp_dir: str,
+        io_mode: IOMode = IOMode.SINGLE,
+    ):
+        self.host = host
+        self.port = port
+        self.io_mode = io_mode
+        self.service = FileTransferService(root_dir, temp_dir)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.logger = logging.getLogger(__name__)
+
+    def start(self):
+        """启动服务器"""
+        try:
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            self.logger.info(f"Server started on {self.server_socket.getsockname()}")
+
+            while True:
+                client, addr = self.server_socket.accept()
+                self.logger.info(f"Accepted connection from {addr}")
+                protocol_socket = ProtocolSocket(client, io_mode=self.io_mode)
+                self._handle_client(protocol_socket)
+
+        except Exception as e:
+            self.logger.error(f"Server error: {e}")
+        finally:
+            self.server_socket.close()
+
+    def _handle_client(self, protocol_socket: ProtocolSocket):
+        """处理客户端连接"""
+        try:
+            while True:
+                try:
+                    # ProtocolSocket只负责最基础的收发
+                    header, payload = protocol_socket.receive_message()
+                except ConnectionError:
+                    self.logger.info("Client disconnected")
+                    break
+
+                # FileTransferService负责消息的处理和响应构建
+                response_header_bytes, response_payload = self.service.handle_message(
+                    header, payload
+                )
+
+                # ProtocolSocket只负责发送字节
+                protocol_socket.send_message(response_header_bytes, response_payload)
+
+        except Exception as e:
+            self.logger.error(f"Error handling client: {e}")
+        finally:
+            protocol_socket.close()
+
+
+class AsyncProtocolServer:
+    """异步版本的协议服务器"""
+
+    def __init__(self, host: str, port: int, root_dir: str, temp_dir: str):
+        self.host = host
+        self.port = port
+        self.logger = logging.getLogger(__name__)
+
+    async def start(self):
+        """启动异步服务器"""
+        server = await asyncio.start_server(self._handle_client, self.host, self.port)
+
+        async with server:
+            await server.serve_forever()
+
+    async def _handle_client(self, reader, writer):
+        """处理异步客户端连接"""
+        protocol_socket = ProtocolSocket(None, io_mode=IOMode.ASYNC)
+        protocol_socket.socket = (reader, writer)
+        protocol_socket.connected = True
+
+        try:
+            while True:
+                try:
+                    header, payload = await protocol_socket.async_receive_message()
+                except ConnectionError:
+                    break
+
+                response_header, response_payload = self.service.handle_message(
+                    header, payload
+                )
+
+                await protocol_socket.async_send_message(
+                    msg_type=response_header.msg_type, payload=response_payload
+                )
+
+        except Exception as e:
+            self.logger.error(f"Error handling client: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+# 使用示例
+"""
+# 同步服务器
+server = ProtocolServer(
+    host="localhost",
+    port=8000,
+    root_dir="/path/to/files",
+    temp_dir="/path/to/temp",
+    io_mode=IOMode.SINGLE  # 或 THREADED, NONBLOCKING
+)
+server.start()
+
+# 异步服务器
+async_server = AsyncProtocolServer(
+    host="localhost",
+    port=8000,
+    root_dir="/path/to/files",
+    temp_dir="/path/to/temp"
+)
+asyncio.run(async_server.start())
+"""

@@ -120,7 +120,9 @@ class MessageBuilder:
 
     def build_file_data(self, data: bytes, chunk_number: int) -> Tuple[bytes, bytes]:
         """构建文件数据消息"""
-        return self.build_message(MessageType.FILE_DATA, chunk_number, data)
+        # 直接传 data 作为 payload
+        header = self._build_header(MessageType.FILE_DATA, data, chunk_number)
+        return header.to_bytes(), data
 
     def build_checksum_verify(self, checksum: int) -> Tuple[bytes, bytes]:
         """构建校验和验证消息"""

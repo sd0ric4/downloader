@@ -7,6 +7,7 @@ import struct
 from typing import Set, Dict
 from filetransfer.server.transfer import FileTransferService
 from filetransfer.server.utils import TransferUtils
+from filetransfer.protocol import ProtocolState
 
 
 def setup_logging():
@@ -116,7 +117,7 @@ def main():
         tracker = ChunkTracker(file_size, chunk_size)
 
         # 模拟已接收的块 0, 2, 3
-        received_chunks = {0, 3, 1}  # 块号从0开始
+        received_chunks = {0, 2}  # 块号从0开始
         tracker.mark_chunks_received(received_chunks)
 
         logger.info(f"已接收的块: {sorted(list(tracker.received_chunks))}")
@@ -150,6 +151,7 @@ def main():
         logger.info(f"目标文件大小: {dest_size} bytes")
 
         # 初始化传输服务
+        # 根目录就是root_dir,也就是service的当前目录
         service = FileTransferService(str(root_dir), str(temp_dir))
         transfer_utils = TransferUtils(service)
 
@@ -186,16 +188,23 @@ def main():
                 logger.info("文件大小匹配!")
             else:
                 logger.error("文件大小不匹配!")
-
             # 验证文件内容
             with open(final_file, "rb") as f:
                 final_content = f.read()
+                if final_content == content:
+                    logger.info("文件内容匹配!")
+                else:
+                    logger.error("文件内容不匹配!")
 
-            if final_content == content:
-                logger.info("文件内容匹配!")
-            else:
-                logger.error("文件内容不匹配!")
-
+        # 转化为connected状态
+        utils = TransferUtils(service)
+        result = utils.list_directory(".", recursive=True)
+        print(result)
+        if result.success:
+            for name, size, mtime, is_dir in result.entries:
+                print(f"{'[DIR]' if is_dir else '[FILE]'} {name} {size} {mtime}")
+        else:
+            print(f"列表失败: {result.message}")
     except Exception as e:
         logger.exception("测试过程中发生错误")
         if (temp_dir / f"1_{dest_filename}").exists():
