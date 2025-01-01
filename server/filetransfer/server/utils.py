@@ -1,16 +1,31 @@
 import logging
 import struct
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple, Optional, List
 
 from ..protocol import (
     MessageType,
     ProtocolHeader,
+    ListRequest,
+    ListFilter,
+    ListResponseFormat,
     PROTOCOL_MAGIC,
 )
 from .transfer import FileTransferService
+from ..protocol.tools import MessageBuilder
+
+
+@dataclass
+class ListResult:
+    """列表结果"""
+
+    success: bool
+    message: str
+    entries: List[Tuple[str, int, int, bool]] = field(
+        default_factory=list
+    )  # [(文件名,大小,修改时间,是否目录)]
 
 
 @dataclass
@@ -34,6 +49,7 @@ class TransferUtils:
             chunk_size: 分块大小,默认8KB
         """
         self.service = service
+        self.message_builder = MessageBuilder()
         self.chunk_size = chunk_size
         self.logger = logging.getLogger(__name__)
 
@@ -126,7 +142,11 @@ class TransferUtils:
             return TransferResult(False, f"传输错误: {str(e)}", 0)
 
     def resume_transfer(
-        self, file_path: str, dest_filename: str, offset: int
+        self,
+        file_path: str,
+        dest_filename: str,
+        offset: int,
+        chunk_size: int = None,  # 添加chunk_size参数
     ) -> TransferResult:
         """断点续传实现
 
@@ -285,3 +305,89 @@ class TransferUtils:
         with open(file_path, "rb") as f:
             file_data = f.read()
             return zlib.crc32(file_data)
+
+    def list_directory(
+        self,
+        path: str = "",
+        list_format: ListResponseFormat = ListResponseFormat.DETAIL,
+        list_filter: ListFilter = ListFilter.ALL,
+    ) -> ListResult:
+        """列出目录内容
+
+        Args:
+            path: 目录路径,相对于根目录的路径
+            list_format: 列表格式,默认详细格式
+            list_filter: 列表过滤条件,默认全部
+
+        Returns:
+            ListResult: 列表结果
+        """
+        try:
+            # 初始化连接
+            self.service.start_session()
+
+            # 发送handshake消息
+
+            # 创建列表请求
+            list_req = ListRequest(format=list_format, filter=list_filter, path=path)
+
+            # 发送请求
+            payload = list_req.to_bytes()
+            header = self.create_header(MessageType.LIST_REQUEST, len(payload))
+
+            # 获取响应
+            response_header, response_payload = self.service.handle_message(
+                header, payload
+            )
+            resp_header = ProtocolHeader.from_bytes(response_header)
+
+            if resp_header.msg_type == MessageType.ERROR:
+                error_msg = response_payload.decode("utf-8")
+                return ListResult(False, f"获取列表失败: {error_msg}")
+
+            if resp_header.msg_type != MessageType.LIST_RESPONSE:
+                return ListResult(False, "响应类型错误")
+
+            # 解析响应
+            entries = self._parse_list_response(response_payload)
+            return ListResult(True, "获取列表成功", entries)
+
+        except Exception as e:
+            self.logger.error(f"获取列表失败: {str(e)}")
+            return ListResult(False, f"获取列表错误: {str(e)}")
+
+    def _parse_list_response(self, payload: bytes) -> List[Tuple[str, int, int, bool]]:
+        """解析列表响应数据
+
+        Args:
+            payload: 响应数据
+
+        Returns:
+            List[Tuple[str, int, int, bool]]: [(文件名,大小,修改时间,是否目录)]
+        """
+        entries = []
+        offset = 4  # 跳过格式标识符
+
+        try:
+            while offset < len(payload):
+                # 解析布尔值（is_dir）、大小和修改时间
+                is_dir, size, mtime = struct.unpack(
+                    "!?QQ", payload[offset : offset + 17]
+                )
+                offset += 17
+
+                # 解析文件名长度
+                name_length = struct.unpack("!H", payload[offset : offset + 2])[0]
+                offset += 2
+
+                # 解析文件名
+                name = payload[offset : offset + name_length].decode("utf-8")
+                offset += name_length
+
+                entries.append((name, size, mtime, is_dir))
+
+            return entries
+
+        except Exception as e:
+            self.logger.error(f"解析响应数据失败: {str(e)}")
+            return []
