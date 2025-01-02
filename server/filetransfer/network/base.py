@@ -13,6 +13,8 @@ class BaseSocket:
         self.io_mode = io_mode
         self.read_buffer = bytearray()
         self.write_buffer = bytearray()
+        self.reader = None
+        self.writer = None
         self.connected = False
         if io_mode == IOMode.THREADED:
             self._write_queue = queue.Queue()
@@ -46,8 +48,7 @@ class BaseSocket:
     async def async_connect(self, host, port):
         if self.io_mode != IOMode.ASYNC:
             raise RuntimeError("Only available in async mode")
-        reader, writer = await asyncio.open_connection(host, port)
-        self.socket = (reader, writer)
+        self.reader, self.writer = await asyncio.open_connection(host, port)
         self.connected = True
 
     def _start_threads(self):
@@ -104,14 +105,16 @@ class BaseSocket:
         return None
 
     async def _async_send(self, data):
-        _, writer = self.socket
-        writer.write(data)
-        await writer.drain()
+        if not self.writer:
+            raise RuntimeError("Writer is not initialized")
+        self.writer.write(data)
+        await self.writer.drain()
         return len(data)
 
     async def _async_recv(self, size):
-        reader, _ = self.socket
-        return await reader.read(size)
+        if not self.reader:
+            raise RuntimeError("Reader is not initialized")
+        return await self.reader.read(size)
 
     def _send_all(self, data: bytes) -> int:
         if self.io_mode == IOMode.ASYNC:
