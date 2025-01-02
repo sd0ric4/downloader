@@ -394,6 +394,7 @@ class AsyncProtocolServer:
 
     def __init__(self, host: str, port: int, root_dir: str, temp_dir: str):
         self.host = host
+        self.service = FileTransferService(root_dir, temp_dir)
         self.port = port
         self.logger = logging.getLogger(__name__)
 
@@ -407,9 +408,9 @@ class AsyncProtocolServer:
     async def _handle_client(self, reader, writer):
         """处理异步客户端连接"""
         protocol_socket = ProtocolSocket(None, io_mode=IOMode.ASYNC)
-        protocol_socket.socket = (reader, writer)
         protocol_socket.connected = True
-
+        protocol_socket.reader = reader
+        protocol_socket.writer = writer
         try:
             while True:
                 try:
@@ -422,7 +423,7 @@ class AsyncProtocolServer:
                 )
 
                 await protocol_socket.async_send_message(
-                    msg_type=response_header.msg_type, payload=response_payload
+                    response_header, response_payload
                 )
 
         except Exception as e:
