@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
+import select
 import struct
+import threading
 from typing import Optional, Dict, Tuple, List
 import logging
 from dataclasses import dataclass
@@ -431,6 +433,202 @@ class AsyncProtocolServer:
         finally:
             writer.close()
             await writer.wait_closed()
+
+
+class SelectServer:
+    """基于多线程和 select 架构的文件传输服务器"""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        root_dir: str,
+        temp_dir: str,
+        io_mode: IOMode = IOMode.SINGLE,
+    ):
+        self.host = host
+        self.port = port
+        self.io_mode = io_mode
+        self.root_dir = root_dir
+        self.temp_dir = temp_dir
+        self.file_manager = FileManager(root_dir, temp_dir)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setblocking(False)
+        self.logger = logging.getLogger(__name__)
+        self.clients = {}  # 存储所有已连接客户端的协议套接字
+        self._shutdown_flag = False
+
+    def start(self):
+        """启动服务器"""
+        try:
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            self.server_socket.setblocking(False)
+            self.logger.info(f"Server started on {self.server_socket.getsockname()}")
+
+            # 初始化 select 监听列表
+            inputs = [self.server_socket]
+            outputs = []
+            while not self._shutdown_flag:
+                # 使用 select 来监听所有活跃的 socket 连接
+                readable, writable, exceptional = select.select(
+                    inputs, outputs, inputs, 0.1
+                )
+
+                for s in readable:
+                    if s is self.server_socket:
+                        # 接受新连接
+                        self._accept_connection(inputs)
+                    else:
+                        # 处理已连接的客户端数据
+                        self._handle_client_message(s, inputs, outputs)
+
+                # 可写的 socket 会被处理（例如异步响应）
+                for s in writable:
+                    pass  # 可根据需要添加对输出的处理
+
+                # 错误的 socket（通常是客户端断开连接）
+                for s in exceptional:
+                    self._handle_client_error(s, inputs, outputs)
+
+        except Exception as e:
+            self.logger.error(f"Server error: {e}")
+        finally:
+            self.server_socket.close()
+
+    def _accept_connection(self, inputs):
+        """接受新连接并将其添加到输入列表"""
+        client_socket, addr = self.server_socket.accept()
+        self.logger.info(f"Accepted connection from {addr}")
+        client_socket.setblocking(False)
+        inputs.append(client_socket)
+        protocol_socket = ProtocolSocket(client_socket, io_mode=self.io_mode)
+        self.clients[client_socket] = protocol_socket
+
+    def _handle_client_message(self, client_socket, inputs, outputs):
+        """处理客户端消息"""
+        protocol_socket = self.clients.get(client_socket)
+        if protocol_socket is None:
+            return
+
+        try:
+            # 接收消息
+            header, payload = protocol_socket.receive_message()
+
+            # 使用文件管理服务处理消息
+            response_header, response_payload = self._process_message(header, payload)
+
+            # 发送响应
+            protocol_socket.send_message(response_header, response_payload)
+
+        except ConnectionError:
+            self.logger.info("Client disconnected")
+            self._handle_client_error(client_socket, inputs, outputs)
+
+    def _handle_client_error(self, client_socket, inputs, outputs):
+        """处理客户端断开连接的错误"""
+        if client_socket in inputs:
+            inputs.remove(client_socket)
+        if client_socket in outputs:
+            outputs.remove(client_socket)
+        protocol_socket = self.clients.pop(client_socket, None)
+        if protocol_socket:
+            protocol_socket.close()
+        client_socket.close()
+
+    def _process_message(self, header: ProtocolHeader, payload: bytes) -> tuple:
+        """处理消息并生成响应"""
+        # 假设有一个MessageBuilder负责消息构建
+        message_builder = MessageBuilder()
+        if header.msg_type == MessageType.HANDSHAKE:
+            return message_builder.build_handshake()
+        # 处理其他消息类型
+        return message_builder.build_error("Unknown message type")
+
+    def stop(self):
+        """优雅地停止服务器"""
+        self._shutdown_flag = True
+        for client_socket in self.clients:
+            client_socket.close()
+        self.server_socket.close()
+
+
+class ThreadedServer:
+    """基于多线程的文件传输服务器"""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        root_dir: str,
+        temp_dir: str,
+        io_mode: IOMode = IOMode.SINGLE,
+    ):
+        self.host = host
+        self.port = port
+        self.io_mode = io_mode
+        self.root_dir = root_dir
+        self.temp_dir = temp_dir
+        self.file_manager = FileManager(root_dir, temp_dir)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.logger = logging.getLogger(__name__)
+
+    def start(self):
+        """启动服务器"""
+        try:
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            self.logger.info(f"Server started on {self.server_socket.getsockname()}")
+
+            while True:
+                client, addr = self.server_socket.accept()
+                self.logger.info(f"Accepted connection from {addr}")
+                # 启动一个新线程处理客户端
+                client_thread = threading.Thread(
+                    target=self._handle_client, args=(client,)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+
+        except Exception as e:
+            self.logger.error(f"Server error: {e}")
+        finally:
+            self.server_socket.close()
+
+    def _handle_client(self, client_socket):
+        """处理客户端连接"""
+        try:
+            protocol_socket = ProtocolSocket(client_socket, io_mode=self.io_mode)
+
+            while True:
+                try:
+                    header, payload = protocol_socket.receive_message()
+
+                    # 使用文件管理服务处理消息
+                    response_header, response_payload = self._process_message(
+                        header, payload
+                    )
+
+                    # 发送响应
+                    protocol_socket.send_message(response_header, response_payload)
+
+                except ConnectionError:
+                    self.logger.info("Client disconnected")
+                    break
+
+        except Exception as e:
+            self.logger.error(f"Error handling client: {e}")
+        finally:
+            client_socket.close()
+
+    def _process_message(self, header: ProtocolHeader, payload: bytes) -> tuple:
+        """处理消息并生成响应"""
+        # 假设有一个MessageBuilder负责消息构建
+        message_builder = MessageBuilder()
+        if header.msg_type == MessageType.HANDSHAKE:
+            return message_builder.build_handshake()
+        # 处理其他消息类型
+        return message_builder.build_error("Unknown message type")
 
 
 # 使用示例
