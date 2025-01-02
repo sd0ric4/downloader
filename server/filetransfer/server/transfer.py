@@ -570,6 +570,7 @@ class ThreadedServer:
         self.root_dir = root_dir
         self.temp_dir = temp_dir
         self.file_manager = FileManager(root_dir, temp_dir)
+        self.service = FileTransferService(root_dir, temp_dir)
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.logger = logging.getLogger(__name__)
 
@@ -605,7 +606,7 @@ class ThreadedServer:
                     header, payload = protocol_socket.receive_message()
 
                     # 使用文件管理服务处理消息
-                    response_header, response_payload = self._process_message(
+                    response_header, response_payload = self.service.handle_message(
                         header, payload
                     )
 
