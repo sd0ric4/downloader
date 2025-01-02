@@ -205,13 +205,11 @@ class TestAsyncFileTransfer(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(header.msg_type, MessageType.HANDSHAKE)
 
             # 2. 异步文件请求
-            filename = "async_output.txt"
+            filename = "测试.txt"
             header_bytes, payload = message_builder.build_file_request(filename)
             await client.async_send_message(header_bytes, payload)
             header, payload = await client.async_receive_message()
-            self.assertIn(
-                header.msg_type, [MessageType.FILE_ACCEPT, MessageType.FILE_METADATA]
-            )
+            self.assertIn(header.msg_type, [MessageType.FILE_METADATA])
 
             # 3. 异步发送文件数据
             with open(self.test_file_path, "rb") as f:
