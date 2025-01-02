@@ -29,12 +29,6 @@ class ProtocolSocket(BaseSocket):
 
         return True
 
-    async def async_send_message(self, header_bytes: bytes, payload: bytes = b""):
-        """异步发送消息"""
-        if self.io_mode != IOMode.ASYNC:
-            raise RuntimeError("Only available in async mode")
-        return await self.async_send_all(header_bytes + payload)
-
     def receive_message(self):
         """最基础的接收消息功能"""
         if self.io_mode == IOMode.ASYNC:
@@ -57,17 +51,40 @@ class ProtocolSocket(BaseSocket):
 
         return header, payload
 
+    async def async_send_message(self, header_bytes: bytes, payload: bytes = b""):
+        """异步发送消息"""
+        if self.io_mode != IOMode.ASYNC:
+            raise RuntimeError("Only available in async mode")
+
+        if not self.writer:
+            raise RuntimeError("Writer is not initialized")
+
+        # 使用 async_send_all 发送数据
+        return await self.async_send_all(header_bytes + payload)
+
     async def async_receive_message(self):
         """异步接收消息"""
         if self.io_mode != IOMode.ASYNC:
             raise RuntimeError("Only available in async mode")
-        header_data = await self.async_recv_all(self.HEADER_SIZE)
-        header = ProtocolHeader.from_bytes(header_data)
-        payload = await self.async_recv_all(header.payload_length)
-        return header, payload
+
+        try:
+            header_data = await self.async_recv_all(self.HEADER_SIZE)
+            if not header_data:
+                raise ConnectionError("Failed to receive header")
+
+            header = ProtocolHeader.from_bytes(header_data)
+            payload = await self.async_recv_all(header.payload_length)
+            return header, payload
+        except Exception as e:
+            raise RuntimeError(f"Error receiving message: {e}")
 
     def close(self):
         """关闭连接"""
+        if self.writer:
+            try:
+                self.writer.close()
+            except:
+                pass
         if self.socket:
             try:
                 self.socket.close()
