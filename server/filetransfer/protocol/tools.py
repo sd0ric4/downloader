@@ -159,7 +159,7 @@ class MessageBuilder:
         payload = error_msg.encode("utf-8")
         return self.build_message(MessageType.LIST_ERROR, payload)
 
-    # 新增: 会话管理方法®
+    # 新增: 会话管理方法
     def start_session(self) -> None:
         """开始新会话"""
         self.session_id += 1

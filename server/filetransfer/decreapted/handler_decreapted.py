@@ -130,6 +130,7 @@ class BaseProtocolHandler(ABC):
             if self.state == ProtocolState.CONNECTED:
                 # CONNECTED 状态可以处理的消息
                 if header.msg_type in {
+                    MessageType.HANDSHAKE,
                     MessageType.FILE_REQUEST,
                     MessageType.LIST_REQUEST,
                     MessageType.NLST_REQUEST,
@@ -143,6 +144,7 @@ class BaseProtocolHandler(ABC):
             elif self.state == ProtocolState.TRANSFERRING:
                 # TRANSFERRING 状态可以处理的消息
                 if header.msg_type in {
+                    MessageType.HANDSHAKE,
                     MessageType.FILE_DATA,
                     MessageType.FILE_METADATA,
                     MessageType.CHECKSUM_VERIFY,

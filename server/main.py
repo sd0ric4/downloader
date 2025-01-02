@@ -7,7 +7,6 @@ import struct
 from typing import Set, Dict
 from filetransfer.server.transfer import FileTransferService
 from filetransfer.server.utils import TransferUtils
-from filetransfer.protocol import ProtocolState
 
 
 def setup_logging():

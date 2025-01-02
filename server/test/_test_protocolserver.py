@@ -97,6 +97,17 @@ class TestFileTransferSystem(unittest.TestCase):
         self.assertEqual(header.msg_type, MessageType.HANDSHAKE)
         self.assertEqual(header.magic, PROTOCOL_MAGIC)
 
+    # 测试多次握手
+    def test_multiple_handshakes(self):
+        """测试多次客户端握手"""
+        message_builder = MessageBuilder(version=ProtocolVersion.V1)
+        header_bytes, payload = message_builder.build_handshake()
+
+        for _ in range(3):
+            self.client.send_message(header_bytes, payload)
+            header, payload = self.client.receive_message()
+            self.assertEqual(header.msg_type, MessageType.HANDSHAKE)
+
     def test_file_transfer(self):
         """测试完整的文件传输过程"""
         message_builder = MessageBuilder(version=ProtocolVersion.V1)

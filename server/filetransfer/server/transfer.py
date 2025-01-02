@@ -3,11 +3,12 @@ from pathlib import Path
 import select
 import struct
 import threading
+import time
 from typing import Optional, Dict, Tuple, List
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-import os
+import uuid
 import zlib
 from .file_manager import FileManager, TransferContext
 from filetransfer.protocol import (
@@ -21,6 +22,98 @@ from filetransfer.protocol import (
 from filetransfer.protocol.tools import MessageBuilder
 import socket
 from filetransfer.network import ProtocolSocket, IOMode
+
+
+@dataclass
+class SessionInfo:
+    """会话信息"""
+
+    service: "FileTransferService"
+    created_at: datetime
+    last_active: datetime
+    client_address: str
+
+
+class SessionManager:
+    """会话管理器，负责为每个客户端维护独立的 FileTransferService 实例"""
+
+    def __init__(self, root_dir: str, temp_dir: str):
+        self.root_dir = root_dir
+        self.temp_dir = temp_dir
+        self._sessions: Dict[str, SessionInfo] = {}
+        self._lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
+
+    def create_session(self, client_address: str) -> tuple[str, "FileTransferService"]:
+        """创建新的会话"""
+        with self._lock:
+            # 为每个会话创建独立的临时目录
+            session_id = str(uuid.uuid4())
+            session_temp_dir = Path(self.temp_dir) / session_id
+            session_temp_dir.mkdir(parents=True, exist_ok=True)
+
+            # 创建新的 FileTransferService 实例
+            service = FileTransferService(self.root_dir, str(session_temp_dir))
+            service.start_session()  # 初始化服务状态
+
+            # 记录会话信息
+            now = datetime.now()
+            self._sessions[session_id] = SessionInfo(
+                service=service,
+                created_at=now,
+                last_active=now,
+                client_address=client_address,
+            )
+
+            self.logger.info(
+                f"Created new session {session_id} for client {client_address}"
+            )
+            return session_id, service
+
+    def get_session(self, session_id: str) -> "FileTransferService":
+        """获取已存在的会话服务实例"""
+        with self._lock:
+            if session_id in self._sessions:
+                session = self._sessions[session_id]
+                session.last_active = datetime.now()
+                return session.service
+            return None
+
+    def close_session(self, session_id: str):
+        """关闭并清理会话"""
+        with self._lock:
+            if session_id in self._sessions:
+                session = self._sessions.pop(session_id)
+                # 清理会话临时目录
+                session_temp_dir = Path(self.temp_dir) / session_id
+                try:
+                    for file in session_temp_dir.glob("*"):
+                        file.unlink()
+                    session_temp_dir.rmdir()
+                except Exception as e:
+                    self.logger.error(f"Error cleaning up session directory: {e}")
+
+                self.logger.info(
+                    f"Closed session {session_id} for client {session.client_address}"
+                )
+
+    def cleanup_inactive_sessions(self, max_age_minutes: int = 30):
+        """清理不活跃的会话"""
+        with self._lock:
+            now = datetime.now()
+            inactive_sessions = [
+                session_id
+                for session_id, info in self._sessions.items()
+                if (now - info.last_active).total_seconds() > max_age_minutes * 60
+            ]
+
+            for session_id in inactive_sessions:
+                self.close_session(session_id)
+
+    def get_active_sessions_count(self) -> int:
+        """获取活跃会话数量"""
+        with self._lock:
+            return len(self._sessions)
 
 
 class FileTransferService:
@@ -74,12 +167,15 @@ class FileTransferService:
         valid_transitions = {
             ProtocolState.INIT: [MessageType.HANDSHAKE],
             ProtocolState.CONNECTED: [
+                MessageType.HANDSHAKE,
                 MessageType.FILE_REQUEST,
                 MessageType.LIST_REQUEST,
                 MessageType.NLST_REQUEST,
                 MessageType.RESUME_REQUEST,
+                MessageType.CLOSE,
             ],
             ProtocolState.TRANSFERRING: [
+                MessageType.HANDSHAKE,
                 MessageType.FILE_DATA,
                 MessageType.CHECKSUM_VERIFY,
                 MessageType.ACK,
@@ -331,7 +427,7 @@ class FileTransferService:
 
 
 class ProtocolServer:
-    """基于 ProtocolSocket 的文件传输服务器"""
+    """基于 ProtocolSocket 的文件传输服务器，支持每个客户端独立会话"""
 
     def __init__(
         self,
@@ -344,7 +440,7 @@ class ProtocolServer:
         self.host = host
         self.port = port
         self.io_mode = io_mode
-        self.service = FileTransferService(root_dir, temp_dir)
+        self.session_manager = SessionManager(root_dir, temp_dir)
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.logger = logging.getLogger(__name__)
 
@@ -355,72 +451,102 @@ class ProtocolServer:
             self.server_socket.listen(5)
             self.logger.info(f"Server started on {self.server_socket.getsockname()}")
 
+            # 启动会话清理线程
+            cleanup_thread = threading.Thread(
+                target=self._cleanup_sessions_periodically, daemon=True
+            )
+            cleanup_thread.start()
+
             while True:
                 client, addr = self.server_socket.accept()
                 self.logger.info(f"Accepted connection from {addr}")
                 protocol_socket = ProtocolSocket(client, io_mode=self.io_mode)
-                self._handle_client(protocol_socket)
+                self._handle_client(protocol_socket, addr)
 
         except Exception as e:
             self.logger.error(f"Server error: {e}")
         finally:
             self.server_socket.close()
 
-    def _handle_client(self, protocol_socket: ProtocolSocket):
+    def _handle_client(self, protocol_socket: ProtocolSocket, client_addr: tuple):
         """处理客户端连接"""
+        session_id = None
         try:
+            # 为新客户端创建会话
+            session_id, service = self.session_manager.create_session(
+                f"{client_addr[0]}:{client_addr[1]}"
+            )
+
             while True:
                 try:
-                    # ProtocolSocket只负责最基础的收发
                     header, payload = protocol_socket.receive_message()
                 except ConnectionError:
                     self.logger.info("Client disconnected")
                     break
 
-                # FileTransferService负责消息的处理和响应构建
-                response_header_bytes, response_payload = self.service.handle_message(
+                # 使用会话特定的服务处理消息
+                response_header_bytes, response_payload = service.handle_message(
                     header, payload
                 )
 
-                # ProtocolSocket只负责发送字节
                 protocol_socket.send_message(response_header_bytes, response_payload)
 
         except Exception as e:
             self.logger.error(f"Error handling client: {e}")
         finally:
+            if session_id:
+                self.session_manager.close_session(session_id)
             protocol_socket.close()
+
+    def _cleanup_sessions_periodically(self, interval_minutes: int = 5):
+        """定期清理不活跃的会话"""
+        while True:
+            time.sleep(interval_minutes * 60)
+            self.session_manager.cleanup_inactive_sessions()
 
 
 class AsyncProtocolServer:
-    """异步版本的协议服务器"""
+    """异步版本的协议服务器，支持每个客户端独立会话"""
 
     def __init__(self, host: str, port: int, root_dir: str, temp_dir: str):
         self.host = host
-        self.service = FileTransferService(root_dir, temp_dir)
         self.port = port
+        self.session_manager = SessionManager(root_dir, temp_dir)
         self.logger = logging.getLogger(__name__)
 
     async def start(self):
         """启动异步服务器"""
         server = await asyncio.start_server(self._handle_client, self.host, self.port)
 
+        # 启动会话清理任务
+        asyncio.create_task(self._cleanup_sessions_periodically())
+
         async with server:
             await server.serve_forever()
 
     async def _handle_client(self, reader, writer):
         """处理异步客户端连接"""
+        session_id = None
         protocol_socket = ProtocolSocket(None, io_mode=IOMode.ASYNC)
         protocol_socket.connected = True
         protocol_socket.reader = reader
         protocol_socket.writer = writer
+
         try:
+            # 获取客户端地址
+            client_addr = writer.get_extra_info("peername")
+            # 创建新会话
+            session_id, service = self.session_manager.create_session(
+                f"{client_addr[0]}:{client_addr[1]}"
+            )
+
             while True:
                 try:
                     header, payload = await protocol_socket.async_receive_message()
                 except ConnectionError:
                     break
 
-                response_header, response_payload = self.service.handle_message(
+                response_header, response_payload = service.handle_message(
                     header, payload
                 )
 
@@ -431,8 +557,16 @@ class AsyncProtocolServer:
         except Exception as e:
             self.logger.error(f"Error handling client: {e}")
         finally:
+            if session_id:
+                self.session_manager.close_session(session_id)
             writer.close()
             await writer.wait_closed()
+
+    async def _cleanup_sessions_periodically(self, interval_minutes: int = 5):
+        """定期清理不活跃的会话"""
+        while True:
+            await asyncio.sleep(interval_minutes * 60)
+            self.session_manager.cleanup_inactive_sessions()
 
 
 class SelectServer:
@@ -449,6 +583,7 @@ class SelectServer:
         self.host = host
         self.port = port
         self.io_mode = io_mode
+        self.service = FileTransferService(root_dir, temp_dir)
         self.root_dir = root_dir
         self.temp_dir = temp_dir
         self.file_manager = FileManager(root_dir, temp_dir)
@@ -516,7 +651,9 @@ class SelectServer:
             header, payload = protocol_socket.receive_message()
 
             # 使用文件管理服务处理消息
-            response_header, response_payload = self._process_message(header, payload)
+            response_header, response_payload = self.service.handle_message(
+                header, payload
+            )
 
             # 发送响应
             protocol_socket.send_message(response_header, response_payload)
@@ -548,9 +685,21 @@ class SelectServer:
     def stop(self):
         """优雅地停止服务器"""
         self._shutdown_flag = True
-        for client_socket in self.clients:
-            client_socket.close()
-        self.server_socket.close()
+        # 关闭所有客户端连接
+        client_sockets = list(self.clients.keys())  # 创建副本避免修改字典时的迭代错误
+        for client_socket in client_sockets:
+            try:
+                self._handle_client_error(client_socket, [], [])
+            except:
+                pass  # 忽略关闭过程中的错误
+
+        # 关闭服务器socket
+        try:
+            if hasattr(self, "server_socket"):
+                self.server_socket.shutdown(socket.SHUT_RDWR)
+                self.server_socket.close()
+        except:
+            pass  # 忽略关闭过程中的错误
 
 
 class ThreadedServer:
@@ -573,6 +722,72 @@ class ThreadedServer:
         self.service = FileTransferService(root_dir, temp_dir)
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.logger = logging.getLogger(__name__)
+        self._shutdown_flag = False  # 初始化标志
+        self._active_clients = set()  # 跟踪活动的客户端连接
+        self._clients_lock = threading.Lock()
+
+    def stop(self):
+        """优雅地停止服务器"""
+        self._shutdown_flag = True
+
+        # 关闭所有活动的客户端连接
+        with self._clients_lock:
+            for client_socket in list(self._active_clients):  # 使用列表副本遍历
+                try:
+                    client_socket.shutdown(socket.SHUT_RDWR)
+                    client_socket.close()
+                except:
+                    pass  # 忽略关闭过程中的错误
+            self._active_clients.clear()
+
+        # 关闭服务器socket
+        try:
+            self.server_socket.shutdown(socket.SHUT_RDWR)
+        except:
+            pass  # 忽略关闭过程中的错误
+
+        try:
+            self.server_socket.close()
+        except:
+            pass
+
+    def _handle_client(self, client_socket):
+        """处理客户端连接"""
+        try:
+            # 添加到活动客户端集合
+            with self._clients_lock:
+                self._active_clients.add(client_socket)
+
+            protocol_socket = ProtocolSocket(client_socket, io_mode=self.io_mode)
+
+            while not self._shutdown_flag:
+                try:
+                    header, payload = protocol_socket.receive_message()
+                    if not header:  # 检查连接是否已关闭
+                        break
+
+                    response_header, response_payload = self.service.handle_message(
+                        header, payload
+                    )
+
+                    if not protocol_socket.send_message(
+                        response_header, response_payload
+                    ):
+                        break  # 发送失败表示连接已关闭
+
+                except (ConnectionError, socket.error):
+                    break  # 任何连接错误都中断循环
+
+        except Exception as e:
+            self.logger.error(f"Error handling client: {e}")
+        finally:
+            # 从活动客户端集合中移除
+            with self._clients_lock:
+                self._active_clients.discard(client_socket)  # 使用discard避免KeyError
+            try:
+                client_socket.close()
+            except:
+                pass
 
     def start(self):
         """启动服务器"""
@@ -581,55 +796,36 @@ class ThreadedServer:
             self.server_socket.listen(5)
             self.logger.info(f"Server started on {self.server_socket.getsockname()}")
 
-            while True:
-                client, addr = self.server_socket.accept()
-                self.logger.info(f"Accepted connection from {addr}")
-                # 启动一个新线程处理客户端
-                client_thread = threading.Thread(
-                    target=self._handle_client, args=(client,)
-                )
-                client_thread.daemon = True
-                client_thread.start()
-
-        except Exception as e:
-            self.logger.error(f"Server error: {e}")
-        finally:
-            self.server_socket.close()
-
-    def _handle_client(self, client_socket):
-        """处理客户端连接"""
-        try:
-            protocol_socket = ProtocolSocket(client_socket, io_mode=self.io_mode)
-
-            while True:
+            while not self._shutdown_flag:
                 try:
-                    header, payload = protocol_socket.receive_message()
+                    self.server_socket.settimeout(
+                        1.0
+                    )  # 设置超时，以便定期检查shutdown标志
+                    try:
+                        client, addr = self.server_socket.accept()
+                        self.logger.info(f"Accepted connection from {addr}")
+                        client_thread = threading.Thread(
+                            target=self._handle_client, args=(client,)
+                        )
+                        client_thread.daemon = True
+                        client_thread.start()
+                    except socket.timeout:
+                        continue  # 超时后检查shutdown标志
+                    except socket.error as e:
+                        if self._shutdown_flag:
+                            break
+                        self.logger.error(f"Accept error: {e}")
 
-                    # 使用文件管理服务处理消息
-                    response_header, response_payload = self.service.handle_message(
-                        header, payload
-                    )
-
-                    # 发送响应
-                    protocol_socket.send_message(response_header, response_payload)
-
-                except ConnectionError:
-                    self.logger.info("Client disconnected")
-                    break
+                except Exception as e:
+                    if self._shutdown_flag:
+                        break
+                    self.logger.error(f"Server loop error: {e}")
 
         except Exception as e:
-            self.logger.error(f"Error handling client: {e}")
+            if not self._shutdown_flag:  # 只在非正常关闭时记录错误
+                self.logger.error(f"Server error: {e}")
         finally:
-            client_socket.close()
-
-    def _process_message(self, header: ProtocolHeader, payload: bytes) -> tuple:
-        """处理消息并生成响应"""
-        # 假设有一个MessageBuilder负责消息构建
-        message_builder = MessageBuilder()
-        if header.msg_type == MessageType.HANDSHAKE:
-            return message_builder.build_handshake()
-        # 处理其他消息类型
-        return message_builder.build_error("Unknown message type")
+            self.stop()  # 确保所有资源都被清理
 
 
 # 使用示例
