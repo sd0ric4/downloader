@@ -7,7 +7,6 @@ from typing import List, Tuple
 
 from ..protocol import (
     MessageType,
-    ProtocolHeader,
     ListRequest,
     ListFilter,
     ListResponseFormat,
