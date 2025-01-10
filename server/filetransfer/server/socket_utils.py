@@ -31,6 +31,7 @@ class TransferResult:
     message: str
     transferred_size: int = 0
     checksum: int = 0
+    chunk_data: Optional[bytes] = None
 
 
 class ChunkTracker:
@@ -401,3 +402,187 @@ class NetworkTransferUtils:
         with open(file_path, "rb") as f:
             file_data = f.read()
             return zlib.crc32(file_data)
+
+
+class DownloadManager:
+    def __init__(self, network_utils: NetworkTransferUtils, temp_dir: Path):
+        self.network_utils = network_utils
+        self.temp_dir = temp_dir
+        self.logger = logging.getLogger(__name__)
+        self.protocol_socket = network_utils.protocol_socket
+
+    def download_file(self, remote_path: str, local_path: str) -> TransferResult:
+        """支持断点续传的下载实现"""
+        try:
+            local_path = Path(local_path)
+            temp_file = self.temp_dir / f"{local_path.name}.temp"
+            state_file = self.temp_dir / f"{local_path.name}.state"
+
+            # 获取文件元数据
+            file_size, checksum = self._get_file_metadata(remote_path)
+            if file_size is None:
+                return TransferResult(False, "获取文件元数据失败")
+
+            # 检查是否存在未完成的下载
+            chunk_tracker = self._load_download_state(state_file)
+            if chunk_tracker is None or chunk_tracker.file_size != file_size:
+                # 只在没有状态文件或文件大小变化时创建新的 tracker
+                chunk_tracker = ChunkTracker(file_size, self.network_utils.chunk_size)
+                self.logger.info("创建新的下载任务")
+            else:
+                self.logger.info(
+                    f"继续未完成的下载，已完成: {len(chunk_tracker.received_chunks)}/{chunk_tracker.total_chunks} 块"
+                )
+
+            # 创建或打开临时文件
+            temp_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # 如果临时文件不存在，创建一个空文件
+            if not temp_file.exists():
+                temp_file.touch()
+
+            with open(temp_file, "r+b") as f:  # 使用 r+b 模式以支持读写
+                while True:
+                    missing_chunks = chunk_tracker.get_missing_chunks()
+                    if not missing_chunks:
+                        break
+
+                    for chunk_number in sorted(missing_chunks):  # 按顺序下载缺失的块
+                        result = self._download_chunk(remote_path, chunk_number)
+
+                        if not result.success:
+                            # 保存当前状态
+                            chunk_tracker.save_state(state_file)
+                            return TransferResult(
+                                False, f"下载块 {chunk_number} 失败: {result.message}"
+                            )
+
+                        if result.chunk_data:
+                            # 写入数据块到正确的位置
+                            f.seek(chunk_number * self.network_utils.chunk_size)
+                            f.write(result.chunk_data)
+                            chunk_tracker.mark_chunk_received(chunk_number)
+
+                            # 立即刷新到磁盘
+                            f.flush()
+
+                            # 更新进度
+                            progress = (
+                                len(chunk_tracker.received_chunks)
+                                / chunk_tracker.total_chunks
+                            ) * 100
+                            self.logger.info(f"下载进度: {progress:.2f}%")
+
+                            # 定期保存状态
+                            chunk_tracker.save_state(state_file)
+
+            # 完成后进行校验
+            actual_checksum = self.network_utils._calculate_file_checksum(temp_file)
+            if actual_checksum != checksum:
+                self.logger.error(f"校验失败: 期望={checksum}, 实际={actual_checksum}")
+                return TransferResult(False, "文件校验失败")
+
+            # 下载完成，移动到目标位置
+            temp_file.rename(local_path)
+            state_file.unlink(missing_ok=True)
+
+            return TransferResult(True, "下载成功", file_size, checksum)
+
+        except Exception as e:
+            self.logger.error(f"下载错误: {str(e)}")
+            if state_file.exists():
+                self.logger.info("保留断点续传状态文件以供后续使用")
+            return TransferResult(False, f"下载错误: {str(e)}")
+
+    def _get_file_metadata(
+        self, remote_path: str
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """获取远程文件的元数据"""
+        try:
+            # 握手
+            handshake_header, handshake_payload = (
+                self.network_utils.message_builder.build_handshake()
+            )
+            self.network_utils.protocol_socket.send_message(
+                handshake_header, handshake_payload
+            )
+            resp_header, _ = self.network_utils.protocol_socket.receive_message()
+            if resp_header.msg_type == MessageType.ERROR:
+                return None, None
+
+            # 发送文件请求
+            file_req_header, file_req_payload = (
+                self.network_utils.message_builder.build_file_request(remote_path)
+            )
+            self.network_utils.protocol_socket.send_message(
+                file_req_header, file_req_payload
+            )
+            resp_header, resp_payload = (
+                self.network_utils.protocol_socket.receive_message()
+            )
+
+            if resp_header.msg_type != MessageType.FILE_METADATA:
+                return None, None
+
+            # 解析文件元数据
+            file_size, checksum = struct.unpack("!QI", resp_payload[:12])
+            return file_size, checksum
+
+        except Exception as e:
+            self.logger.error(f"获取文件元数据失败: {str(e)}")
+            return None, None
+
+    def _download_chunk(self, remote_path: str, chunk_number: int) -> TransferResult:
+        """下载单个数据块"""
+        try:
+            # 发送数据块请求
+            data_req_header, _ = self.network_utils.message_builder.build_file_data(
+                b"", chunk_number
+            )
+            self.protocol_socket.send_message(data_req_header, b"")
+
+            # 接收数据块
+            data_header, chunk_data = (
+                self.network_utils.protocol_socket.receive_message()
+            )
+
+            if data_header.msg_type != MessageType.FILE_DATA:
+                return TransferResult(False, "数据块响应类型无效", chunk_data=None)
+
+            if data_header.chunk_number != chunk_number:
+                return TransferResult(
+                    False,
+                    f"块序号不匹配: 期望 {chunk_number}, 收到 {data_header.chunk_number}",
+                    chunk_data=None,
+                )
+
+            # 正确设置返回值
+            return TransferResult(
+                success=True,
+                message="成功",
+                transferred_size=len(chunk_data),
+                checksum=0,  # 这里我们不计算单个块的校验和
+                chunk_data=chunk_data,
+            )
+
+        except Exception as e:
+            return TransferResult(False, f"下载数据块失败: {str(e)}", chunk_data=None)
+
+    def _load_download_state(self, state_file: Path) -> Optional[ChunkTracker]:
+        """加载下载状态"""
+        try:
+            if state_file.exists():
+                return ChunkTracker.load_state(state_file)
+            return None
+        except Exception as e:
+            self.logger.error(f"加载下载状态失败: {str(e)}")
+            return None
+
+    def _verify_download(self, file_path: Path, expected_checksum: int) -> bool:
+        """验证下载文件的完整性"""
+        try:
+            actual_checksum = self.network_utils._calculate_file_checksum(file_path)
+            return actual_checksum == expected_checksum
+        except Exception as e:
+            self.logger.error(f"文件验证失败: {str(e)}")
+            return False

@@ -578,7 +578,7 @@ class SelectServer:
         port: int,
         root_dir: str,
         temp_dir: str,
-        io_mode: IOMode = IOMode.SINGLE,
+        io_mode: IOMode = IOMode.NONBLOCKING,
     ):
         self.host = host
         self.port = port
@@ -711,7 +711,7 @@ class ThreadedServer:
         port: int,
         root_dir: str,
         temp_dir: str,
-        io_mode: IOMode = IOMode.SINGLE,
+        io_mode: IOMode = IOMode.THREADED,
     ):
         self.host = host
         self.port = port
