@@ -1,12 +1,12 @@
 'use client';
 import React, { useState, useEffect, useRef, type ChangeEvent } from 'react';
-import { Power, Settings, RefreshCw, Terminal, Moon, Sun } from 'lucide-react';
+import { Power, Settings, RefreshCw, Terminal } from 'lucide-react';
 import { useTheme } from '~/hooks/useTheme';
 import { ThemeMenu } from '../components/ThemeMenu';
 
 interface LogEntry {
   timestamp: string;
-  level: 'ERROR' | 'WARNING' | 'INFO';
+  level: string;
   module: string;
   message: string;
 }
@@ -17,7 +17,15 @@ interface ServerConfig {
   root_dir: string;
   temp_dir: string;
   server_type: 'protocol' | 'threaded' | 'select' | 'async';
-  io_mode: 'single' | 'threaded' | 'nonblocking';
+  io_mode: 'single' | 'threaded' | 'nonblocking' | 'async';
+}
+
+interface ServerStatusResponse {
+  running: boolean;
+  server_type?: string;
+  host?: string;
+  port?: number;
+  active_connections?: number;
 }
 
 const ServerControl: React.FC = () => {
@@ -25,6 +33,7 @@ const ServerControl: React.FC = () => {
   const [serverStatus, setServerStatus] = useState<'running' | 'stopped'>(
     'stopped'
   );
+  const [activeConnections, setActiveConnections] = useState<number>(0);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -39,56 +48,75 @@ const ServerControl: React.FC = () => {
     io_mode: 'single',
   });
 
+  // 检查服务器状态
+  const checkServerStatus = async () => {
+    try {
+      const response = await fetch('/server/status');
+      const data: ServerStatusResponse = await response.json();
+      setServerStatus(data.running ? 'running' : 'stopped');
+      setActiveConnections(data.active_connections || 0);
+    } catch (error) {
+      console.error('Failed to check server status:', error);
+    }
+  };
+
+  // 定期检查服务器状态和获取日志
   useEffect(() => {
     if (!mounted) return;
+
+    const checkStatus = setInterval(checkServerStatus, 5000);
 
     if (serverStatus === 'running') {
       const fetchLogs = async () => {
         try {
-          const response = await fetch('/api/server/logs');
+          const response = await fetch('/server/logs');
           const data = await response.json();
           setLogs(data.logs);
+          // 自动滚动到日志底部
+          logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
         } catch (error) {
           console.error('Failed to fetch logs:', error);
         }
       };
 
-      const interval = setInterval(fetchLogs, 2000);
-      return () => clearInterval(interval);
+      const logsInterval = setInterval(fetchLogs, 2000);
+      return () => {
+        clearInterval(checkStatus);
+        clearInterval(logsInterval);
+      };
     }
+
+    return () => clearInterval(checkStatus);
   }, [serverStatus, mounted]);
 
-  const handleConfigChange = (
-    e: ChangeEvent<HTMLInputElement | HTMLSelectElement>
-  ) => {
-    const { name, value } = e.target;
-    setConfig((prev) => ({
-      ...prev,
-      [name]: name === 'port' ? parseInt(value, 10) : value,
-    }));
+  // 检查 IO 模式是否可用
+  const isIOModeAvailable = (mode: string) => {
+    if (config.server_type === 'async') {
+      return mode === 'async';
+    }
+    return mode !== 'async';
   };
 
   const handleServerControl = async () => {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch('/api/server/control', {
+      const endpoint =
+        serverStatus === 'running' ? '/server/stop' : '/server/start';
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          action: serverStatus === 'running' ? 'stop' : 'start',
-          config,
-        }),
+        body: serverStatus === 'running' ? undefined : JSON.stringify(config),
       });
 
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to control server');
+        throw new Error(errorData.detail || '服务器控制失败');
       }
 
-      setServerStatus(serverStatus === 'running' ? 'stopped' : 'running');
+      await checkServerStatus();
     } catch (err: unknown) {
       if (err instanceof Error) {
         setError(err.message);
@@ -100,11 +128,34 @@ const ServerControl: React.FC = () => {
     }
   };
 
+  const handleConfigChange = (
+    e: ChangeEvent<HTMLInputElement | HTMLSelectElement>
+  ) => {
+    const { name, value } = e.target;
+    setConfig((prev) => {
+      const newConfig = {
+        ...prev,
+        [name]: name === 'port' ? parseInt(value, 10) : value,
+      };
+
+      // 当服务器类型改变时，自动调整 IO 模式
+      if (name === 'server_type') {
+        if (value === 'async') {
+          newConfig.io_mode = 'async';
+        } else if (prev.io_mode === 'async') {
+          newConfig.io_mode = 'single';
+        }
+      }
+
+      return newConfig;
+    });
+  };
+
   if (!mounted) return null;
 
   return (
     <div
-      className={`min-h-screen ${currentTheme.background} ${currentTheme.text} transition-colors duration-300`}
+      className={`min-h-screen ${currentTheme.background} ${currentTheme.text}`}
     >
       {/* 头部栏 */}
       <div className={`w-full px-6 py-4 border-b ${currentTheme.border}`}>
@@ -115,6 +166,9 @@ const ServerControl: React.FC = () => {
             </h1>
           </div>
           <div className='flex items-center gap-4'>
+            <div className={`px-4 py-2 rounded-lg ${currentTheme.card}`}>
+              活动连接数: {activeConnections}
+            </div>
             <ThemeMenu
               theme={theme}
               setTheme={setTheme}
@@ -139,10 +193,13 @@ const ServerControl: React.FC = () => {
               <button
                 onClick={handleServerControl}
                 disabled={isLoading}
-                aria-label={
-                  serverStatus === 'running' ? '停止服务器' : '启动服务器'
-                }
-                className={`w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-lg font-medium hover:scale-105 transition-transform ${currentTheme.activeButton} ${currentTheme.border}`}
+                className={`w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-lg font-medium 
+                  ${
+                    serverStatus === 'running'
+                      ? 'bg-red-500 hover:bg-red-600'
+                      : 'bg-green-500 hover:bg-green-600'
+                  } 
+                  text-white transition-colors`}
               >
                 {isLoading ? (
                   <RefreshCw className='animate-spin' size={20} />
@@ -179,8 +236,8 @@ const ServerControl: React.FC = () => {
                     name='host'
                     value={config.host}
                     onChange={handleConfigChange}
-                    placeholder='输入主机地址'
-                    className={`w-full p-2 rounded-lg border focus:ring-2 focus:ring-blue-500 ${currentTheme.input}`}
+                    disabled={serverStatus === 'running'}
+                    className={`w-full p-2 rounded-lg border ${currentTheme.input}`}
                   />
                 </div>
 
@@ -197,60 +254,61 @@ const ServerControl: React.FC = () => {
                     name='port'
                     value={config.port}
                     onChange={handleConfigChange}
-                    placeholder='输入端口号'
-                    className={`w-full p-2 rounded-lg border focus:ring-2 focus:ring-blue-500 ${currentTheme.input}`}
+                    disabled={serverStatus === 'running'}
+                    className={`w-full p-2 rounded-lg border ${currentTheme.input}`}
                   />
                 </div>
 
                 <div>
                   <label
-                    htmlFor='rootDir'
+                    htmlFor='root_dir'
                     className={`block text-sm font-medium mb-1 ${currentTheme.subtext}`}
                   >
                     根目录
                   </label>
                   <input
-                    id='rootDir'
+                    id='root_dir'
                     type='text'
-                    name='rootDir'
+                    name='root_dir'
                     value={config.root_dir}
                     onChange={handleConfigChange}
-                    placeholder='输入根目录路径'
-                    className={`w-full p-2 rounded-lg border focus:ring-2 focus:ring-blue-500 ${currentTheme.input}`}
+                    disabled={serverStatus === 'running'}
+                    className={`w-full p-2 rounded-lg border ${currentTheme.input}`}
                   />
                 </div>
 
                 <div>
                   <label
-                    htmlFor='tempDir'
+                    htmlFor='temp_dir'
                     className={`block text-sm font-medium mb-1 ${currentTheme.subtext}`}
                   >
                     临时目录
                   </label>
                   <input
-                    id='tempDir'
+                    id='temp_dir'
                     type='text'
-                    name='tempDir'
+                    name='temp_dir'
                     value={config.temp_dir}
                     onChange={handleConfigChange}
-                    placeholder='输入临时目录路径'
-                    className={`w-full p-2 rounded-lg border focus:ring-2 focus:ring-blue-500 ${currentTheme.input}`}
+                    disabled={serverStatus === 'running'}
+                    className={`w-full p-2 rounded-lg border ${currentTheme.input}`}
                   />
                 </div>
 
                 <div>
                   <label
-                    htmlFor='serverType'
+                    htmlFor='server_type'
                     className={`block text-sm font-medium mb-1 ${currentTheme.subtext}`}
                   >
                     服务器类型
                   </label>
                   <select
-                    id='serverType'
-                    name='serverType'
+                    id='server_type'
+                    name='server_type'
                     value={config.server_type}
                     onChange={handleConfigChange}
-                    className={`w-full p-2 rounded-lg border focus:ring-2 focus:ring-blue-500 ${currentTheme.input}`}
+                    disabled={serverStatus === 'running'}
+                    className={`w-full p-2 rounded-lg border ${currentTheme.input}`}
                   >
                     <option value='protocol'>Protocol</option>
                     <option value='threaded'>Threaded</option>
@@ -261,21 +319,29 @@ const ServerControl: React.FC = () => {
 
                 <div>
                   <label
-                    htmlFor='ioMode'
+                    htmlFor='io_mode'
                     className={`block text-sm font-medium mb-1 ${currentTheme.subtext}`}
                   >
                     IO 模式
                   </label>
                   <select
-                    id='ioMode'
-                    name='ioMode'
+                    id='io_mode'
+                    name='io_mode'
                     value={config.io_mode}
                     onChange={handleConfigChange}
-                    className={`w-full p-2 rounded-lg border focus:ring-2 focus:ring-blue-500 ${currentTheme.input}`}
+                    disabled={serverStatus === 'running'}
+                    className={`w-full p-2 rounded-lg border ${currentTheme.input}`}
                   >
-                    <option value='single'>Single</option>
-                    <option value='threaded'>Threaded</option>
-                    <option value='nonblocking'>Non-blocking</option>
+                    {config.server_type !== 'async' && (
+                      <>
+                        <option value='single'>Single</option>
+                        <option value='threaded'>Threaded</option>
+                        <option value='nonblocking'>Non-blocking</option>
+                      </>
+                    )}
+                    {config.server_type === 'async' && (
+                      <option value='async'>Async</option>
+                    )}
                   </select>
                 </div>
               </div>
@@ -304,13 +370,13 @@ const ServerControl: React.FC = () => {
                       <div key={index} className='py-1'>
                         <span className='text-gray-500'>[{log.timestamp}]</span>{' '}
                         <span
-                          className={`${
+                          className={
                             log.level === 'ERROR'
                               ? 'text-red-400'
                               : log.level === 'WARNING'
                               ? 'text-yellow-400'
                               : 'text-green-400'
-                          }`}
+                          }
                         >
                           {log.level}
                         </span>{' '}

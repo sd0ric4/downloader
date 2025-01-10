@@ -1,226 +1,264 @@
-import argparse
-import asyncio
-import logging
-import os
-import time
-from datetime import datetime
-from queue import Queue
 from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
-
+import logging
+from typing import Optional, Dict, List
+from enum import Enum
+import threading
+import asyncio
+from collections import deque
+import time
+import os
 from filetransfer.server.transfer import (
     ThreadedServer,
-    ProtocolServer,
     AsyncProtocolServer,
     SelectServer,
+    ProtocolServer,
 )
 from filetransfer.network import IOMode
 
-# Create FastAPI app
-app = FastAPI()
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# 设置日志格式
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-
-# Global variables
-current_server = None
-server_process = None
-log_queue = Queue(maxsize=1000)  # Store last 1000 log messages
+logger = logging.getLogger(__name__)
 
 
-class LogRecord(BaseModel):
+class LogEntry(BaseModel):
     timestamp: str
     level: str
     module: str
     message: str
 
 
+class LogStore:
+    def __init__(self, maxlen=1000):
+        self.logs = deque(maxlen=maxlen)
+
+    def add_log(self, record):
+        self.logs.append(
+            {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "level": record.levelname,
+                "module": record.name,
+                "message": record.getMessage(),
+            }
+        )
+
+    def get_logs(self):
+        return list(self.logs)
+
+
+class LogHandler(logging.Handler):
+    def __init__(self, log_store):
+        super().__init__()
+        self.log_store = log_store
+
+    def emit(self, record):
+        self.log_store.add_log(record)
+
+
+class ServerType(str, Enum):
+    PROTOCOL = "protocol"
+    THREADED = "threaded"
+    SELECT = "select"
+    ASYNC = "async"
+
+
+class ServerIOMode(str, Enum):
+    SINGLE = "single"
+    THREADED = "threaded"
+    NONBLOCKING = "nonblocking"
+    ASYNC = "async"
+
+
 class ServerConfig(BaseModel):
     host: str = "localhost"
     port: int = 8001
-    rootDir: str = "./server_files/root"
-    tempDir: str = "./server_files/temp"
-    serverType: str = "protocol"
-    ioMode: str = "single"
+    root_dir: str = "./server_files/root"
+    temp_dir: str = "./server_files/temp"
+    server_type: ServerType = ServerType.PROTOCOL
+    io_mode: ServerIOMode = ServerIOMode.SINGLE
 
 
-class ServerControl(BaseModel):
-    action: str
-    config: ServerConfig
+class ServerStatus(BaseModel):
+    running: bool
+    server_type: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    active_connections: Optional[int] = None
 
 
-class QueueHandler(logging.Handler):
-    def __init__(self, queue):
-        super().__init__()
-        self.queue = queue
-
-    def emit(self, record):
-        try:
-            # Format the log message
-            log_entry = {
-                "timestamp": datetime.fromtimestamp(record.created).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "level": record.levelname,
-                "module": record.module,
-                "message": record.getMessage(),
-            }
-
-            # Add to queue, removing oldest if full
-            if self.queue.full():
-                self.queue.get()
-            self.queue.put(log_entry)
-        except Exception:
-            self.handleError(record)
+class ServerState:
+    def __init__(self):
+        self.instance = None
+        self.config = None
+        self.server_thread = None
+        self.event_loop = None
+        self.async_task = None
 
 
-def setup_logging(log_file=None):
-    # Create queue handler
-    queue_handler = QueueHandler(log_queue)
-    queue_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    )
+app = FastAPI(title="File Transfer Server Control")
 
-    handlers = [queue_handler]
+# 全局状态
+server_state = ServerState()
+log_store = LogStore()
 
-    # Add file handler if specified
-    if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
-        handlers.append(file_handler)
-
-    # Configure logging
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
+# 添加日志处理器
+logger.addHandler(LogHandler(log_store))
 
 
-def create_directories(root_dir, temp_dir):
+def create_directories(root_dir: str, temp_dir: str):
+    """创建必要的目录"""
     for directory in [root_dir, temp_dir]:
         os.makedirs(directory, exist_ok=True)
-        logging.info(f"Created directory: {directory}")
 
 
-async def run_async_server(config: ServerConfig):
-    server = AsyncProtocolServer(
-        host=config.host,
-        port=config.port,
-        root_dir=config.rootDir,
-        temp_dir=config.tempDir,
-    )
-    await server.start()
+def run_sync_server(server):
+    """运行同步服务器"""
+    try:
+        server.start()
+    except Exception as e:
+        logger.error(f"Server error: {e}")
 
 
-def run_server(server_type: str, config: ServerConfig):
-    server_classes = {
-        "protocol": ProtocolServer,
-        "threaded": ThreadedServer,
-        "select": SelectServer,
-    }
-
-    ServerClass = server_classes[server_type]
-    server = ServerClass(
-        host=config.host,
-        port=config.port,
-        root_dir=config.rootDir,
-        temp_dir=config.tempDir,
-        io_mode=IOMode[config.ioMode.upper()],
-    )
-    return server
+async def run_async_server(server):
+    """运行异步服务器"""
+    try:
+        await server.start()
+    except Exception as e:
+        logger.error(f"Async server error: {e}")
 
 
-@app.get("/api/server/logs")
-async def get_logs():
-    # Convert queue to list without removing items
-    logs = list(log_queue.queue)
-    return {"logs": logs}
+@app.post("/server/start")
+async def start_server(config: ServerConfig):
+    global server_state
 
-
-@app.post("/api/server/control")
-async def control_server(control: ServerControl):
-    global current_server, server_process
-
-    if control.action not in ["start", "stop"]:
-        raise HTTPException(status_code=400, detail="Invalid action")
-
-    if control.action == "start" and current_server:
+    if server_state.instance:
         raise HTTPException(status_code=400, detail="Server is already running")
 
-    if control.action == "stop" and not current_server:
+    try:
+        create_directories(config.root_dir, config.temp_dir)
+        logger.info(f"Starting server with config: {config.dict()}")
+
+        if config.server_type == ServerType.ASYNC:
+            # 处理异步服务器
+            server_state.instance = AsyncProtocolServer(
+                host=config.host,
+                port=config.port,
+                root_dir=config.root_dir,
+                temp_dir=config.temp_dir,
+            )
+            server_state.event_loop = asyncio.new_event_loop()
+            server_state.async_task = server_state.event_loop.create_task(
+                run_async_server(server_state.instance)
+            )
+            server_state.server_thread = threading.Thread(
+                target=lambda: server_state.event_loop.run_forever(), daemon=True
+            )
+            server_state.server_thread.start()
+        else:
+            # 处理同步服务器
+            server_classes = {
+                ServerType.PROTOCOL: ProtocolServer,
+                ServerType.THREADED: ThreadedServer,
+                ServerType.SELECT: SelectServer,
+            }
+
+            ServerClass = server_classes[config.server_type]
+            server_state.instance = ServerClass(
+                host=config.host,
+                port=config.port,
+                root_dir=config.root_dir,
+                temp_dir=config.temp_dir,
+                io_mode=IOMode[config.io_mode.upper()],
+            )
+
+            server_state.server_thread = threading.Thread(
+                target=run_sync_server, args=(server_state.instance,), daemon=True
+            )
+            server_state.server_thread.start()
+
+        server_state.config = config
+        logger.info("Server started successfully")
+        return {"message": "Server started successfully"}
+
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        server_state = ServerState()  # 失败时重置状态
+        raise HTTPException(status_code=500, detail=f"Failed to start server: {str(e)}")
+
+
+@app.post("/server/stop")
+async def stop_server():
+    global server_state
+
+    if not server_state.instance:
         raise HTTPException(status_code=400, detail="Server is not running")
 
     try:
-        if control.action == "start":
-            logging.info(f"Starting server with configuration: {control.config}")
-            create_directories(control.config.rootDir, control.config.tempDir)
+        logger.info("Stopping server...")
+        if isinstance(server_state.instance, AsyncProtocolServer):
+            # 停止异步服务器
+            if server_state.event_loop:
+                await server_state.instance.stop()
+                server_state.event_loop.call_soon_threadsafe(
+                    server_state.event_loop.stop
+                )
+                server_state.server_thread.join(timeout=5)
+        else:
+            # 停止同步服务器
+            server_state.instance.stop()
+            if server_state.server_thread:
+                server_state.server_thread.join(timeout=5)
 
-            if control.config.serverType == "async":
-                logging.info("Starting async server")
-                server_process = asyncio.create_task(run_async_server(control.config))
-            else:
-                logging.info(f"Starting {control.config.serverType} server")
-                current_server = run_server(control.config.serverType, control.config)
-                current_server.start()
-
-            return {"status": "Server started successfully"}
-        else:  # stop
-            logging.info("Stopping server")
-            if server_process:
-                server_process.cancel()
-                server_process = None
-            if current_server:
-                current_server.stop()
-                current_server = None
-            return {"status": "Server stopped successfully"}
+        logger.info("Server stopped successfully")
+        server_state = ServerState()  # 重置状态
+        return {"message": "Server stopped successfully"}
 
     except Exception as e:
-        logging.error(f"Server operation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to stop server: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to stop server: {str(e)}")
 
 
-@app.get("/api/server/status")
-async def server_status():
-    status = "running" if (current_server or server_process) else "stopped"
-    logging.info(f"Current server status: {status}")
-    return {"status": status}
+@app.get("/server/status")
+async def get_server_status():
+    if not server_state.instance:
+        return ServerStatus(running=False)
+
+    try:
+        active_connections = 0
+        if hasattr(server_state.instance, "session_manager"):
+            active_connections = (
+                server_state.instance.session_manager.get_active_sessions_count()
+            )
+
+        status = ServerStatus(
+            running=True,
+            server_type=(
+                server_state.config.server_type if server_state.config else None
+            ),
+            host=server_state.config.host if server_state.config else None,
+            port=server_state.config.port if server_state.config else None,
+            active_connections=active_connections,
+        )
+        return status
+
+    except Exception as e:
+        logger.error(f"Error getting server status: {e}")
+        return ServerStatus(running=True)
 
 
-# Create a custom logging middleware
-@app.middleware("http")
-async def log_requests(request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    duration = time.time() - start_time
-    logging.info(f"{request.method} {request.url.path} completed in {duration:.2f}s")
-    return response
-
-
-# Serve static files
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+@app.get("/server/logs")
+async def get_logs():
+    """获取服务器日志"""
+    return {"logs": log_store.get_logs()}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="File Transfer Server with Web UI")
-    parser.add_argument("--host", default="localhost", help="API server host")
-    parser.add_argument("--port", type=int, default=8000, help="API server port")
-    parser.add_argument("--log-file", help="Log file path")
-
-    args = parser.parse_args()
-
-    # Setup logging
-    setup_logging(args.log_file)
-
-    # Start the FastAPI server
-    uvicorn.run(app, host=args.host, port=args.port)
+    """主函数"""
+    logger.info("Starting File Transfer Server Control...")
+    uvicorn.run(app, host="0.0.0.0", port=8012)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import asyncio
+import errno
 from pathlib import Path
 import select
 import struct
@@ -468,6 +469,36 @@ class ProtocolServer:
         finally:
             self.server_socket.close()
 
+    def stop(self):
+        """Gracefully stop the server"""
+        try:
+            # First stop accepting new connections
+            if hasattr(self, "server_socket") and self.server_socket:
+                try:
+                    # Get list of all client sockets from session manager
+                    active_sessions = list(self.session_manager._sessions.items())
+
+                    # Close all client connections
+                    for session_id, session_info in active_sessions:
+                        try:
+                            if hasattr(session_info.service, "socket"):
+                                session_info.service.socket.shutdown(socket.SHUT_RDWR)
+                                session_info.service.socket.close()
+                        except Exception as e:
+                            self.logger.warning(f"Error closing client socket: {e}")
+                        self.session_manager.close_session(session_id)
+
+                    # Now close the server socket
+                    self.server_socket.shutdown(socket.SHUT_RDWR)
+                except OSError as e:
+                    if e.errno != errno.ENOTCONN:  # Ignore "not connected"
+                        self.logger.error(f"Error during socket shutdown: {e}")
+                finally:
+                    self.server_socket.close()
+
+        except Exception as e:
+            self.logger.error(f"Error stopping server: {e}")
+
     def _handle_client(self, protocol_socket: ProtocolSocket, client_addr: tuple):
         """处理客户端连接"""
         session_id = None
@@ -516,13 +547,30 @@ class AsyncProtocolServer:
 
     async def start(self):
         """启动异步服务器"""
-        server = await asyncio.start_server(self._handle_client, self.host, self.port)
-
+        self._server = await asyncio.start_server(
+            self._handle_client, self.host, self.port
+        )
         # 启动会话清理任务
         asyncio.create_task(self._cleanup_sessions_periodically())
 
-        async with server:
-            await server.serve_forever()
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def stop(self):
+        """优雅地停止异步服务器"""
+        try:
+            # 关闭所有活跃会话
+            active_sessions = list(self.session_manager._sessions.keys())
+            for session_id in active_sessions:
+                self.session_manager.close_session(session_id)
+
+            # 如果有正在运行的服务器，尝试关闭
+            if hasattr(self, "_server"):
+                self._server.close()
+                await self._server.wait_closed()
+
+        except Exception as e:
+            self.logger.error(f"Error stopping async server: {e}")
 
     async def _handle_client(self, reader, writer):
         """处理异步客户端连接"""
@@ -683,23 +731,42 @@ class SelectServer:
         return message_builder.build_error("Unknown message type")
 
     def stop(self):
-        """优雅地停止服务器"""
+        """Gracefully stop the server"""
         self._shutdown_flag = True
-        # 关闭所有客户端连接
-        client_sockets = list(self.clients.keys())  # 创建副本避免修改字典时的迭代错误
-        for client_socket in client_sockets:
-            try:
-                self._handle_client_error(client_socket, [], [])
-            except:
-                pass  # 忽略关闭过程中的错误
 
-        # 关闭服务器socket
         try:
+            # Close all client connections first
+            client_sockets = list(self.clients.keys())
+            for client_socket in client_sockets:
+                try:
+                    protocol_socket = self.clients[client_socket]
+                    if protocol_socket:
+                        try:
+                            client_socket.shutdown(socket.SHUT_RDWR)
+                        except OSError as e:
+                            if e.errno != errno.ENOTCONN:
+                                self.logger.warning(
+                                    f"Error shutting down client socket: {e}"
+                                )
+                        finally:
+                            protocol_socket.close()
+                            client_socket.close()
+                except Exception as e:
+                    self.logger.warning(f"Error cleaning up client connection: {e}")
+            self.clients.clear()
+
+            # Then close server socket
             if hasattr(self, "server_socket"):
-                self.server_socket.shutdown(socket.SHUT_RDWR)
-                self.server_socket.close()
-        except:
-            pass  # 忽略关闭过程中的错误
+                try:
+                    self.server_socket.shutdown(socket.SHUT_RDWR)
+                except OSError as e:
+                    if e.errno != errno.ENOTCONN:
+                        self.logger.error(f"Error shutting down server socket: {e}")
+                finally:
+                    self.server_socket.close()
+
+        except Exception as e:
+            self.logger.error(f"Error during server shutdown: {e}")
 
 
 class ThreadedServer:
@@ -724,29 +791,36 @@ class ThreadedServer:
         self._clients_lock = threading.Lock()
 
     def stop(self):
-        """优雅地停止服务器"""
+        """Gracefully stop the server"""
         self._shutdown_flag = True
 
-        # 关闭所有活动的客户端连接
-        with self._clients_lock:
-            for client_socket in list(self._active_clients):  # 使用列表副本遍历
+        try:
+            # First close all client connections
+            with self._clients_lock:
+                for client_socket in list(self._active_clients):
+                    try:
+                        client_socket.shutdown(socket.SHUT_RDWR)
+                    except Exception as e:
+                        self.logger.warning(f"Error shutting down client socket: {e}")
+                    finally:
+                        try:
+                            client_socket.close()
+                        except Exception as e:
+                            self.logger.warning(f"Error closing client socket: {e}")
+                self._active_clients.clear()
+
+            # Then close server socket
+            if hasattr(self, "server_socket"):
                 try:
-                    client_socket.shutdown(socket.SHUT_RDWR)
-                    client_socket.close()
-                except:
-                    pass  # 忽略关闭过程中的错误
-            self._active_clients.clear()
+                    self.server_socket.shutdown(socket.SHUT_RDWR)
+                except OSError as e:
+                    if e.errno != errno.ENOTCONN:
+                        self.logger.error(f"Error shutting down server socket: {e}")
+                finally:
+                    self.server_socket.close()
 
-        # 关闭服务器socket
-        try:
-            self.server_socket.shutdown(socket.SHUT_RDWR)
-        except:
-            pass  # 忽略关闭过程中的错误
-
-        try:
-            self.server_socket.close()
-        except:
-            pass
+        except Exception as e:
+            self.logger.error(f"Error during server shutdown: {e}")
 
     def _handle_client(self, client_socket):
         session_id = None

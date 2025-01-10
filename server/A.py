@@ -18,7 +18,7 @@ def test_download():
     root_dir.mkdir(parents=True, exist_ok=True)
 
     # 创建客户端并连接
-    client = SingleThreadClient("localhost", 8002)
+    client = SingleThreadClient("localhost", 8001)
     if not client.connect():
         logger.error("连接服务器失败")
         return
