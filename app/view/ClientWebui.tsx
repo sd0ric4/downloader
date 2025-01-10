@@ -1,3 +1,4 @@
+import React, { useState, useEffect } from 'react';
 import {
   Calendar,
   Download,
@@ -10,30 +11,80 @@ import {
 import ThemeMenu from '~/components/ThemeMenu';
 import { useTheme } from '~/hooks/useTheme';
 
-const mockFiles = [
-  {
-    name: '测试文件.txt',
-    size: 1138522,
-    is_directory: false,
-    modified_time: 1736522270,
-  },
-  {
-    name: '示例文件夹',
-    size: 0,
-    is_directory: true,
-    modified_time: 1736505741,
-  },
-  {
-    name: '大文件.zip',
-    size: 1073741824,
-    is_directory: false,
-    modified_time: 1736522270,
-  },
-];
-
-const FileListPreview = () => {
+const FileListManager = () => {
   const { theme, setTheme, currentTheme, mounted } = useTheme();
-  const formatFileSize = (size: number) => {
+  const [files, setFiles] = useState([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState({});
+
+  // 获取文件列表
+  const fetchFiles = async () => {
+    try {
+      setLoading(true);
+      const response = await fetch('http://localhost:8013/files');
+      const data = await response.json();
+      setFiles(data.files);
+    } catch (error) {
+      console.error('Error fetching files:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 下载文件
+  const downloadFile = async (filename: string) => {
+    try {
+      const response = await fetch('http://localhost:8013/download', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          remote_filename: filename,
+          local_filename: `./test_files/root/${filename}`,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Download failed');
+      }
+
+      // 开始轮询下载进度
+    } catch (error) {
+      console.error('Error downloading file:', error);
+    }
+  };
+
+  // 轮询下载进度
+  const startProgressPolling = (filename) => {
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch(
+          `http://localhost:8013/download/progress/${filename}`
+        );
+        const data = await response.json();
+
+        setDownloadProgress((prev) => ({
+          ...prev,
+          [filename]: data.progress,
+        }));
+
+        if (data.progress === 100) {
+          clearInterval(pollInterval);
+        }
+      } catch (error) {
+        console.error('Error fetching progress:', error);
+        clearInterval(pollInterval);
+      }
+    }, 1000);
+  };
+
+  useEffect(() => {
+    fetchFiles();
+  }, []);
+
+  const formatFileSize = (size) => {
     if (size < 1024) return `${size}B`;
     if (size < 1024 * 1024) return `${(size / 1024).toFixed(2)}KB`;
     if (size < 1024 * 1024 * 1024)
@@ -41,14 +92,20 @@ const FileListPreview = () => {
     return `${(size / 1024 / 1024 / 1024).toFixed(2)}GB`;
   };
 
-  const formatDate = (timestamp: number) => {
+  const formatDate = (timestamp) => {
     return new Date(timestamp * 1000).toLocaleString();
   };
+
+  const filteredFiles = files.filter((file) =>
+    file.name.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
   if (!mounted) return null;
+
   return (
     <div className={`min-h-screen ${currentTheme.background}`}>
       <div className='max-w-7xl mx-auto py-10 px-4 sm:px-6 lg:px-8'>
-        {/* 头部区域 */}
+        {/* Header */}
         <div className='mb-8 flex justify-between items-start'>
           <div>
             <h1 className={`text-2xl font-semibold mb-2 ${currentTheme.text}`}>
@@ -68,7 +125,7 @@ const FileListPreview = () => {
           />
         </div>
 
-        {/* 搜索和操作区 */}
+        {/* Search and Actions */}
         <div className='mb-6 flex flex-col sm:flex-row gap-4'>
           <div className='relative flex-1'>
             <div className='absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none'>
@@ -76,6 +133,8 @@ const FileListPreview = () => {
             </div>
             <input
               type='text'
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
               placeholder='搜索文件...'
               className={`block w-full pl-10 pr-4 py-2.5 rounded-xl border shadow-sm
               focus:outline-none focus:ring-2 focus:ring-opacity-50 focus:ring-blue-500
@@ -83,21 +142,26 @@ const FileListPreview = () => {
             />
           </div>
           <button
+            onClick={fetchFiles}
+            disabled={loading}
             className={`inline-flex items-center justify-center px-4 py-2.5 rounded-xl
-            ${currentTheme.activeButton} shadow-sm hover:shadow gap-2 whitespace-nowrap
-            active:transform active:scale-95 transition-all duration-200`}
+            ${
+              currentTheme.activeButton
+            } shadow-sm hover:shadow gap-2 whitespace-nowrap
+            active:transform active:scale-95 transition-all duration-200
+            ${loading ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
-            <RefreshCw className='w-5 h-5' />
+            <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
             刷新列表
           </button>
         </div>
 
-        {/* 文件列表 */}
+        {/* File List */}
         <div
           className={`${currentTheme.card} backdrop-blur-sm rounded-2xl shadow-xl border ${currentTheme.border} overflow-hidden`}
         >
           <div className='divide-y divide-gray-100/20'>
-            {mockFiles.map((file) => (
+            {filteredFiles.map((file) => (
               <div
                 key={file.name}
                 className={`group relative flex items-center justify-between px-6 py-4 
@@ -143,11 +207,16 @@ const FileListPreview = () => {
                 </div>
                 {!file.is_directory && (
                   <button
+                    onClick={() => downloadFile(file.name)}
                     className={`ml-4 flex items-center px-4 py-2 text-sm rounded-lg gap-2
                     ${currentTheme.button} group-hover:shadow-sm transition-all duration-200`}
                   >
                     <Download className='w-5 h-5' />
-                    <span className='hidden sm:inline'>下载</span>
+                    <span className='hidden sm:inline'>
+                      {downloadProgress[file.name]
+                        ? `${downloadProgress[file.name].toFixed(1)}%`
+                        : '下载'}
+                    </span>
                   </button>
                 )}
               </div>
@@ -155,7 +224,7 @@ const FileListPreview = () => {
           </div>
         </div>
 
-        {/* 底部统计信息 */}
+        {/* Stats */}
         <div className='mt-6 flex items-center justify-between'>
           <div
             className={`text-sm ${currentTheme.subtext} flex items-center gap-2`}
@@ -164,19 +233,19 @@ const FileListPreview = () => {
               className={`px-3 py-1 rounded-full shadow-sm border 
               backdrop-blur-sm ${currentTheme.card} ${currentTheme.border}`}
             >
-              共 {mockFiles.length} 个项目
+              共 {filteredFiles.length} 个项目
             </span>
             <span
               className={`px-3 py-1 rounded-full shadow-sm border 
               backdrop-blur-sm ${currentTheme.card} ${currentTheme.border}`}
             >
-              {mockFiles.filter((f) => f.is_directory).length} 个文件夹
+              {filteredFiles.filter((f) => f.is_directory).length} 个文件夹
             </span>
             <span
               className={`px-3 py-1 rounded-full shadow-sm border 
               backdrop-blur-sm ${currentTheme.card} ${currentTheme.border}`}
             >
-              {mockFiles.filter((f) => !f.is_directory).length} 个文件
+              {filteredFiles.filter((f) => !f.is_directory).length} 个文件
             </span>
           </div>
         </div>
@@ -185,4 +254,4 @@ const FileListPreview = () => {
   );
 };
 
-export default FileListPreview;
+export default FileListManager;
