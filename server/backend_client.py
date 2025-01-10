@@ -64,12 +64,23 @@ async def download_file(request: DownloadRequest):
 @app.get("/download/progress/{filename}")
 async def get_progress(filename: str):
     try:
-        progress = client.get_download_progress(f"./test_files/root/{filename}")
+        progress = client.get_download_progress(f"{filename}")
         if progress is not None:
             return {"progress": progress * 100}  # 转换为百分比
         return {"progress": None}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 你的前端地址
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def main():
