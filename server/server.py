@@ -72,7 +72,7 @@ def main():
     )
     parser.add_argument(
         "--io-mode",
-        choices=["single", "threaded", "nonblocking"],
+        choices=["single", "threaded", "nonblocking", "async"],
         default="single",
         help="IO mode for non-async servers",
     )
