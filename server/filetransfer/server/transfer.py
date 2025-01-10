@@ -156,7 +156,9 @@ class FileTransferService:
             if handler:
                 return handler(header, payload)
             else:
-                return self.message_builder.build_error("Unsupported message type")
+                return self.message_builder.build_error(
+                    "Unsupported message type : " + str(header.msg_type)
+                )
 
         except Exception as e:
             self.logger.error(f"Error handling message: {str(e)}")
@@ -288,6 +290,8 @@ class FileTransferService:
             # 获取实际文件大小
             file_size = file_path.stat().st_size
 
+            # 获取文件checksum
+            checksum = zlib.crc32(file_path.read_bytes())
             # 准备传输上下文
             context = self.file_manager.prepare_transfer(
                 str(header.session_id), filename, file_size
@@ -299,7 +303,9 @@ class FileTransferService:
             self.message_builder.session_id = header.session_id
             self.message_builder.state = ProtocolState.TRANSFERRING
 
-            return self.message_builder.build_file_metadata(filename, file_size, 0)
+            return self.message_builder.build_file_metadata(
+                filename, file_size, checksum
+            )
 
         except UnicodeDecodeError:
             return self.message_builder.build_error("Invalid filename encoding")
@@ -309,7 +315,6 @@ class FileTransferService:
     def _handle_file_data(
         self, header: ProtocolHeader, payload: bytes
     ) -> Tuple[bytes, bytes]:
-        """处理文件数据"""
         try:
             file_id = str(header.session_id)
             context = self.file_manager.transfers.get(file_id)
@@ -317,7 +322,7 @@ class FileTransferService:
             if not context:
                 return self.message_builder.build_error("No active transfer")
 
-            # 验证块号
+            # 计算总块数和当前块的预期大小
             total_chunks = max(
                 1,
                 (context.file_size + self.file_manager.chunk_size - 1)
@@ -328,27 +333,20 @@ class FileTransferService:
                     f"Invalid chunk number: {header.chunk_number}"
                 )
 
-            # 验证块大小
-            expected_size = (
-                min(
-                    self.file_manager.chunk_size,
-                    context.file_size
-                    - header.chunk_number * self.file_manager.chunk_size,
-                )
-                if context.file_size > 0
-                else self.file_manager.chunk_size
+            # 计算当前块的大小
+            expected_size = min(
+                self.file_manager.chunk_size,
+                context.file_size - header.chunk_number * self.file_manager.chunk_size,
             )
-            if len(payload) > expected_size:
-                return self.message_builder.build_error("Chunk size exceeds limit")
 
-            # 写入数据块
-            if not self.file_manager.write_chunk(file_id, payload, header.chunk_number):
-                return self.message_builder.build_error("Failed to write chunk")
+            # 读取文件块
+            file_path = self.root_dir / context.filename
+            with open(file_path, "rb") as f:
+                f.seek(header.chunk_number * self.file_manager.chunk_size)
+                chunk_data = f.read(expected_size)
 
-            # 返回分块确认消息
-            return self.message_builder.build_chunk_ack(
-                header.sequence_number, header.chunk_number
-            )
+            # 构建并返回文件数据消息
+            return self.message_builder.build_file_data(chunk_data, header.chunk_number)
 
         except Exception as e:
             self.logger.error(f"Error handling file data: {str(e)}")
@@ -364,7 +362,9 @@ class FileTransferService:
 
             file_path = self.root_dir / filename
             if not file_path.exists():
-                return self.message_builder.build_error("File not found")
+                return self.message_builder.build_error(
+                    "File path:" + str(file_path) + " does not exist"
+                )
 
             # 获取实际文件大小
             file_size = file_path.stat().st_size
@@ -716,14 +716,11 @@ class ThreadedServer:
         self.host = host
         self.port = port
         self.io_mode = io_mode
-        self.root_dir = root_dir
-        self.temp_dir = temp_dir
-        self.file_manager = FileManager(root_dir, temp_dir)
-        self.service = FileTransferService(root_dir, temp_dir)
+        self.session_manager = SessionManager(root_dir, temp_dir)
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.logger = logging.getLogger(__name__)
-        self._shutdown_flag = False  # 初始化标志
-        self._active_clients = set()  # 跟踪活动的客户端连接
+        self._shutdown_flag = False
+        self._active_clients = set()
         self._clients_lock = threading.Lock()
 
     def stop(self):
@@ -752,9 +749,17 @@ class ThreadedServer:
             pass
 
     def _handle_client(self, client_socket):
-        """处理客户端连接"""
+        session_id = None
         try:
-            # 添加到活动客户端集合
+            # 获取客户端地址
+            client_addr = client_socket.getpeername()
+
+            # 创建新会话
+            session_id, service = self.session_manager.create_session(
+                f"{client_addr[0]}:{client_addr[1]}"
+            )
+
+            # 添加到活动客户端
             with self._clients_lock:
                 self._active_clients.add(client_socket)
 
@@ -763,27 +768,28 @@ class ThreadedServer:
             while not self._shutdown_flag:
                 try:
                     header, payload = protocol_socket.receive_message()
-                    if not header:  # 检查连接是否已关闭
+                    if not header:
                         break
 
-                    response_header, response_payload = self.service.handle_message(
+                    response_header, response_payload = service.handle_message(
                         header, payload
                     )
 
                     if not protocol_socket.send_message(
                         response_header, response_payload
                     ):
-                        break  # 发送失败表示连接已关闭
+                        break
 
                 except (ConnectionError, socket.error):
-                    break  # 任何连接错误都中断循环
+                    break
 
         except Exception as e:
             self.logger.error(f"Error handling client: {e}")
         finally:
-            # 从活动客户端集合中移除
+            if session_id:
+                self.session_manager.close_session(session_id)
             with self._clients_lock:
-                self._active_clients.discard(client_socket)  # 使用discard避免KeyError
+                self._active_clients.discard(client_socket)
             try:
                 client_socket.close()
             except:

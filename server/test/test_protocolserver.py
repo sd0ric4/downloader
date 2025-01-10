@@ -235,7 +235,7 @@ class TestAsyncFileTransfer(unittest.IsolatedAsyncioTestCase):
                     )
                     await client.async_send_message(header_bytes, chunk)
                     header, payload = await client.async_receive_message()
-                    self.assertEqual(header.msg_type, MessageType.ACK)
+                    self.assertEqual(header.msg_type, MessageType.FILE_DATA)
                     chunk_number += 1
 
             # 4. 发送校验和验证

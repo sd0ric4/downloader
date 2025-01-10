@@ -156,7 +156,7 @@ class BaseServerTest:
                 self.client.send_message(header_bytes, chunk)
 
                 header, payload = self.client.receive_message()
-                self.assertEqual(header.msg_type, MessageType.ACK)
+                self.assertEqual(header.msg_type, MessageType.FILE_DATA)
                 chunk_number += 1
 
         # 4. Send checksum verification
