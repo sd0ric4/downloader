@@ -11,15 +11,42 @@ import {
 import ThemeMenu from '~/components/ThemeMenu';
 import { useTheme } from '~/hooks/useTheme';
 
-const FileListManager = () => {
-  const { theme, setTheme, currentTheme, mounted } = useTheme();
-  const [files, setFiles] = useState([]);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState({});
+// 定义文件类型接口
+interface FileItem {
+  name: string;
+  size: number;
+  is_directory: boolean;
+  modified_time: number;
+}
 
+// 定义下载进度类型
+interface DownloadProgress {
+  [key: string]: number;
+}
+interface DownloadStatus {
+  remote_filename: string;
+  local_filename: string;
+  status: 'pending' | 'downloading' | 'completed' | 'failed';
+  progress: number;
+  error: string | null;
+}
+
+interface DownloadStatuses {
+  [key: string]: DownloadStatus;
+}
+const FileListManager: React.FC = () => {
+  const { theme, setTheme, currentTheme, mounted } = useTheme();
+  const [files, setFiles] = useState<FileItem[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [loading, setLoading] = useState<boolean>(false);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress>(
+    {}
+  );
+  const [downloadStatuses, setDownloadStatuses] = useState<DownloadStatuses>(
+    {}
+  );
   // 获取文件列表
-  const fetchFiles = async () => {
+  const fetchFiles = async (): Promise<void> => {
     try {
       setLoading(true);
       const response = await fetch('http://localhost:8013/files');
@@ -33,7 +60,7 @@ const FileListManager = () => {
   };
 
   // 下载文件
-  const downloadFile = async (filename: string) => {
+  const downloadFile = async (filename: string): Promise<void> => {
     try {
       const response = await fetch('http://localhost:8013/download', {
         method: 'POST',
@@ -51,40 +78,41 @@ const FileListManager = () => {
       }
 
       // 开始轮询下载进度
+      startProgressPolling(filename);
     } catch (error) {
       console.error('Error downloading file:', error);
     }
   };
 
   // 轮询下载进度
-  const startProgressPolling = (filename) => {
+  const startProgressPolling = (filename: string): void => {
     const pollInterval = setInterval(async () => {
       try {
         const response = await fetch(
           `http://localhost:8013/download/progress/${filename}`
         );
-        const data = await response.json();
+        const status: DownloadStatus = await response.json();
 
-        setDownloadProgress((prev) => ({
+        setDownloadStatuses((prev) => ({
           ...prev,
-          [filename]: data.progress,
+          [filename]: status,
         }));
 
-        if (data.progress === 100) {
+        // 如果下载完成或失败,停止轮询
+        if (status.status === 'completed' || status.status === 'failed') {
           clearInterval(pollInterval);
         }
       } catch (error) {
-        console.error('Error fetching progress:', error);
+        console.error('Error fetching status:', error);
         clearInterval(pollInterval);
       }
     }, 1000);
   };
-
   useEffect(() => {
     fetchFiles();
   }, []);
 
-  const formatFileSize = (size) => {
+  const formatFileSize = (size: number): string => {
     if (size < 1024) return `${size}B`;
     if (size < 1024 * 1024) return `${(size / 1024).toFixed(2)}KB`;
     if (size < 1024 * 1024 * 1024)
@@ -92,13 +120,58 @@ const FileListManager = () => {
     return `${(size / 1024 / 1024 / 1024).toFixed(2)}GB`;
   };
 
-  const formatDate = (timestamp) => {
+  const formatDate = (timestamp: number): string => {
     return new Date(timestamp * 1000).toLocaleString();
   };
 
   const filteredFiles = files.filter((file) =>
     file.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
+  const getDownloadButtonContent = (filename: string) => {
+    const status = downloadStatuses[filename];
+
+    if (!status) {
+      return (
+        <>
+          <Download className='w-5 h-5' />
+          <span className='hidden sm:inline'>下载</span>
+        </>
+      );
+    }
+
+    switch (status.status) {
+      case 'pending':
+        return (
+          <>
+            <RefreshCw className='w-5 h-5 animate-spin' />
+            <span className='hidden sm:inline'>等待中</span>
+          </>
+        );
+      case 'downloading':
+        return (
+          <>
+            <Download className='w-5 h-5 animate-pulse' />
+            <span className='hidden sm:inline'>
+              {(status.progress * 100).toFixed(1)}%
+            </span>
+          </>
+        );
+      case 'completed':
+        return (
+          <>
+            <Download className='w-5 h-5 text-green-500' />
+            <span className='hidden sm:inline text-green-500'>已完成</span>
+          </>
+        );
+      case 'failed':
+        return (
+          <>
+            <Download className='w-5 h-5 text-red-500' />
+            <span className='hidden sm:inline text-red-500'>失败</span>
+          </>
+        );
+    }
+  };
 
   if (!mounted) return null;
 
@@ -205,18 +278,22 @@ const FileListManager = () => {
                     </div>
                   </div>
                 </div>
+
                 {!file.is_directory && (
                   <button
                     onClick={() => downloadFile(file.name)}
+                    disabled={
+                      downloadStatuses[file.name]?.status === 'downloading'
+                    }
                     className={`ml-4 flex items-center px-4 py-2 text-sm rounded-lg gap-2
-                    ${currentTheme.button} group-hover:shadow-sm transition-all duration-200`}
+    ${currentTheme.button} group-hover:shadow-sm transition-all duration-200
+    ${
+      downloadStatuses[file.name]?.status === 'downloading'
+        ? 'opacity-50 cursor-not-allowed'
+        : ''
+    }`}
                   >
-                    <Download className='w-5 h-5' />
-                    <span className='hidden sm:inline'>
-                      {downloadProgress[file.name]
-                        ? `${downloadProgress[file.name].toFixed(1)}%`
-                        : '下载'}
-                    </span>
+                    {getDownloadButtonContent(file.name)}
                   </button>
                 )}
               </div>

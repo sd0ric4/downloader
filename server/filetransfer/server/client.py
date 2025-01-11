@@ -124,6 +124,7 @@ class SingleThreadClient(BaseClient):
         """
         try:
             state_file = self.temp_dir / f"{Path(local_path).name}.state"
+            self.logger.info(f"state_file: {state_file}")
             if not state_file.exists():
                 return None
 
